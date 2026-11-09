@@ -1,0 +1,33 @@
+# Runtime dependencies for the MSE Maxwell cavity solver.
+#
+# Everything here must install with plain `pip install -r` on aarch64 (the
+# Jetson bench runs this without apt), so there are no system packages.
+#
+# pyvista is required even though the solver is headless: tetgen's `.grid`
+# property returns a pyvista.UnstructuredGrid, and that is how the mesh is read
+# back. It pulls in VTK, which is the heaviest dependency by far.
+#
+# Pinned with `==` to the versions the built image actually contains (read with
+# `pip freeze` inside it), so a rebuild is the same image rather than whatever
+# the index published today. Only the direct requirements are listed; pip still
+# resolves their transitive dependencies, so this file stays readable and the
+# transitive set is not frozen into a shape that breaks on a platform change.
+numpy==2.5.3
+scipy==1.18.1
+# The electrostatic AMG-CG path (mse_electrostatics.amg_solve, meshes over the crossover).
+pyamg==5.4.1
+trimesh==5.1.0
+tetgen==0.8.4
+pyvista==0.49.0
+boto3==1.43.103
+psycopg2-binary==2.9.13
+# Phase 2 (drift-diffusion). 2.11.2 is the cylindrical-capable release verified
+# for task 0.2: it ships cylindrical_node_volume, cylindrical_edge_couple and
+# cylindrical_surface_area, which apply the 2*pi*r weight directly.
+#
+# The wheel is cp39-abi3 manylinux_2_28, so `python:3.12-slim` covers it on
+# Python and glibc. It is NOT self-contained on x86-64 despite declaring no
+# Python dependencies: it dlopen()s a BLAS at import and dies without one.
+# The apt packages and DEVSIM_MATH_LIBS in the Dockerfile are required, not
+# optional -- measured, task 2.1.
+devsim==2.11.2

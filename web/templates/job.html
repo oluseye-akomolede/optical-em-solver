@@ -1,0 +1,240 @@
+{% extends "base.html" %}
+{% block title %}{{ job.original_filename or job.job_id }} — Mode Search Engine{% endblock %}
+{% block content %}
+<section class="card" id="job" data-job-id="{{ job.job_id }}">
+  <h1 id="job-title">{{ job.original_filename or job.job_id }}</h1>
+  {# Two result shapes, two summaries. A pc job has no units, no refractive
+     index of its own and no mode count -- printing the cavity header for it
+     would put "(none) modes requested" over a band diagram. The discriminator
+     is the same `kind` column every other branch reads. #}
+  {% if job.kind == 'pc' and pc_request %}
+    <p class="muted small" id="pc-summary">
+      {{ pc_request.lattice|capitalize }} lattice &middot;
+      rod radius {{ '%g'|format(pc_request.r_over_a) }}&thinsp;a &middot;
+      n<sub>rod</sub> {{ '%g'|format(pc_request.n_rod) }} &middot;
+      n<sub>bg</sub> {{ '%g'|format(pc_request.n_bg) }} &middot;
+      {{ pc_request.n_bands }} bands &middot;
+      {{ pc_request.divisions }} divisions per edge &middot;
+      {{ pc_request.polarisation }} polarisation
+    </p>
+  {% else %}
+    <p class="muted small">
+      Units {{ job.units }} &middot; refractive index {{ job.n_index }} &middot;
+      {{ job.n_modes }} modes requested
+      {%- if job.scale and job.scale != 1.0 %} &middot; scaled &times;{{ '%g'|format(job.scale) }}{% endif %}
+      {%- if resolution %} &middot; <span id="resolution">requested mesh resolution
+      {{ resolution.requested }}</span>{% endif %}
+    </p>
+  {% endif %}
+  {# The requested resolution, in the unit the OWNER typed it in -- which is the
+     feature's own unit and deliberately not the object's. Labelled, because a
+     bare "0.2" beside a "0.27" is a pair the reader has to guess at, and a
+     number the page cannot explain reads as a defect. #}
+  {% if resolution %}
+    <p class="muted small" id="resolution-detail">
+      You asked the mesh to resolve a smallest feature of
+      <strong>{{ resolution.requested }}</strong>.
+      {%- if resolution.achieved %} The mesh it built has a median element edge of
+      <strong>{{ resolution.achieved }}</strong>{%
+      if resolution.over_request %}, larger than you asked for by
+      {{ '%g'|format(resolution.achieved_m / resolution.requested_m) }}&times;{%
+      endif %}. Elements are allowed to come out up to
+      {{ '%g'|format(max_edge_overshoot) }}&times; the requested size before the
+      solver refuses the mesh, so a median in that band is the allowance being
+      used, not a fault — the frequencies are computed on the mesh that was
+      built, so this is a record of what they rest on.
+      {%- else %} This is the size you asked for; the achieved median element
+      edge appears here once the run finishes.{% endif %}
+    </p>
+  {% endif %}
+  {# The EFFECTIVE size, stated in plain numbers. With a scale factor and um/nm
+     units in play, "units" alone no longer says how big the object is, and the
+     frequencies are only right if the size is. #}
+  {% if effective_size %}
+    <p class="muted small" id="effective-size">
+      Inside the solver this object is {{ effective_size }} across.
+    </p>
+  {% endif %}
+
+  {# The material table, rendered from the STORED JSON -- the table the solve
+     actually used -- and deliberately not re-parsed from the upload. The two
+     can be told apart: the file on disk is the one the solver read, and a page
+     that re-derived the names could show a table the solver never saw while
+     every number on it looked right. Sorted by name for a stable order, since
+     JSON object order is not a contract.
+
+     The VALUE is not always a number. A cavity's table is a per-part index,
+     but a td job's holds an index, the string "pec" or a dispersive metal's
+     NAME -- and the cavity-era `'%g'|format(n)` raised "must be real number,
+     not str" on the first metal, an unhandled 500 on the owner's Au/1.5/Au
+     film. Every value goes through the `material_label` filter (web/app.py),
+     whose fallback renders an unknown shape as its own text rather than
+     raising: a reader meeting a name the page does not know is better than a
+     page that cannot be opened at all. #}
+  {% if job.materials and job.kind != 'pc' %}
+    <div id="materials">
+      {% if job.kind == 'td' %}
+        <p class="muted small">
+          Each part of this time-domain run has its own material. A metal name
+          is the solver's dispersive model for that metal over the run's band,
+          and <em>pec</em> is a perfect conductor, which reflects without loss.
+        </p>
+      {% else %}
+        <p class="muted small">
+          This cavity holds {{ job.materials|length }} materials, each meshed to
+          its own resolution (a region's element target is divided by its index,
+          because the wavelength inside is shorter by that factor):
+        </p>
+      {% endif %}
+      <table class="materials">
+        <thead><tr><th>Part</th>
+          <th>{% if job.kind == 'td' %}Material{% else %}Refractive index{% endif %}</th></tr></thead>
+        <tbody>
+          {% for part, value in job.materials|dictsort %}
+            <tr><td>{{ part }}</td><td>{{ value|material_label }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if coating_rows %}
+        <table class="materials" id="coatings">
+          <thead><tr><th>Part</th><th>Coating</th><th>Thickness</th></tr></thead>
+          <tbody>
+            {% for c in coating_rows %}
+              <tr><td>{{ c.part }}</td><td>{{ c.material|material_label }}</td>
+                <td>{{ c.thickness }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {# Where this job runs. Shown from the ROUTING DECISION the app made at upload,
+     not inferred from the status: "queued for the GPU" and "running on the GPU"
+     are different things to wait for, and the owner should be able to tell a job
+     that is waiting for a machine from one that is using it. #}
+  {% if job.kind == 'pc' %}
+    <p class="muted small" id="target-line">
+      This job grows a unit cell, applies the periodic boundary conditions and
+      walks the high-symmetry path in k-space. It runs as an ordinary queued
+      job; there is nothing to watch but the status below.
+    </p>
+  {% elif job.target == 'jetson' %}
+    <p class="muted small" id="target-line">
+      This job is queued for the graphics processor, which solves the larger
+      meshes. If it is not picked up within a few minutes it will be moved back
+      to the cluster queue automatically.
+    </p>
+  {% else %}
+    <p class="muted small" id="target-line">
+      This job runs on the cluster.
+    </p>
+  {% endif %}
+
+  <div id="progress">
+    <p><strong id="status-text">{{ job.status }}</strong>
+      <span class="muted" id="stage-text">{{ job.stage or '' }}</span></p>
+    {% if queue_position and queue_position > 1 %}
+      <p class="muted" id="queue-line">Waiting in the queue: position {{ queue_position }}.</p>
+    {% else %}
+      <p class="muted" id="queue-line" hidden></p>
+    {% endif %}
+    <div class="bar-track"><div class="bar-fill" id="bar"></div></div>
+    <p class="muted small" id="elapsed"></p>
+  </div>
+
+  <div id="failure" hidden>
+    <p class="error" id="failure-text"></p>
+  </div>
+
+  <div id="viewer" hidden>
+    <div class="viewer-wrap">
+      <canvas id="scene"></canvas>
+      <p class="error" id="viewer-fallback" hidden>
+        This plot needs WebGL 2, which this browser either does not have or has
+        turned off. Try a current Chrome, Firefox, Edge or Safari, or turn on
+        hardware acceleration. The mode list below and the “Download for
+        ParaView” link still work, and open the field in ParaView.
+      </p>
+      <div class="legend"><span id="legend-lo"></span>
+        <div class="legend-bar" id="legend-bar"></div>
+        <span id="legend-hi"></span></div>
+      <p class="muted small" id="legend-note"></p>
+      <p class="muted small" id="component-note" hidden></p>
+    </div>
+    <div class="controls">
+      <label class="control-label" for="component-system">Coordinate system</label>
+      <select id="component-system"></select>
+      <label class="control-label" for="component-name">Component</label>
+      <select id="component-name"></select>
+      <span class="muted small" id="mode-caption"></span>
+      <a class="muted small" id="download-vtu" hidden download>Download for ParaView (.vtu)</a>
+    </div>
+    <p class="muted small" id="viewer-hint">
+      Drag to rotate, scroll or pinch to zoom, right-drag or two-finger drag to
+      pan.
+    </p>
+  </div>
+</section>
+
+<section class="card" id="modes-card" hidden>
+  <h2>Modes</h2>
+  <table class="modes">
+    <thead><tr><th>#</th><th>Frequency</th><th>Vacuum wavelength</th></tr></thead>
+    <tbody id="modes-body"></tbody>
+  </table>
+</section>
+
+{# The band diagram. Rendered only for a `kind='pc'` job -- the viewer branches
+   on the payload's kind, and this card stays hidden otherwise. It is a separate
+   card from the modes table so the two result shapes never share a container
+   that could show one job's headings over another's data. #}
+<section class="card" id="bands-card" hidden>
+  <h2>Band diagram</h2>
+  <p class="muted small" id="bands-caption"></p>
+  <svg id="bands-svg" class="bands" width="640" height="380"
+       preserveAspectRatio="xMidYMid meet"></svg>
+  <h3>Band gaps</h3>
+  <table class="modes" id="bands-gaps">
+    <thead><tr><th>Between bands</th><th>Lower &omega;</th><th>Upper &omega;</th>
+      <th>Gap / midgap</th></tr></thead>
+    <tbody id="bands-gaps-body"></tbody>
+  </table>
+  <p class="muted small">
+    &omega; is in units of <code>a/(2&pi;c)</code>, so a gap ratio is
+    dimensionless and is the same figure of merit quoted in the photonic-crystal
+    literature. The shaded bands are windows no state occupies anywhere along
+    the k-path.
+  </p>
+</section>
+
+{# The time-domain result: each probe's trace and spectrum, read from the
+   job's spectrum.json manifest and trace.bin. Hidden unless the payload's kind
+   is 'td', for the same reason as the band card. Caveats from the run are
+   listed here because the spec requires them to reach the owner. #}
+<section class="card" id="td-card" hidden>
+  <h2>Probe traces</h2>
+  <p class="muted small" id="td-caption"></p>
+  <ul class="small" id="td-legend"></ul>
+  <svg id="td-trace-svg" class="bands" width="640" height="300"
+       preserveAspectRatio="xMidYMid meet"></svg>
+  <h3>Spectrum</h3>
+  <svg id="td-spectrum-svg" class="bands" width="640" height="300"
+       preserveAspectRatio="xMidYMid meet"></svg>
+  <ul class="muted small" id="td-caveats"></ul>
+  <div id="td-movie" hidden>
+    <h3>Field movie</h3>
+    <p class="muted small" id="td-movie-caption"></p>
+    <canvas id="td-scene" class="scene"></canvas>
+    <p class="small">
+      <button type="button" id="td-movie-play">Play</button>
+      <input type="range" id="td-movie-frame" min="0" max="0" value="0"
+             aria-label="Movie frame">
+    </p>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script type="module" src="{{ url_for('static', filename='viewer.js') }}"></script>
+{% endblock %}

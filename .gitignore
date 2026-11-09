@@ -1,0 +1,26 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtualenvs
+.venv*/
+venv/
+
+# Local scratch
+*.log
+
+# OpenRig seat projections (generated per seat; never commit)
+CLAUDE.md
+.openrig/
+scratch/
+
+# Held by a running tests/check_discriminating.py (see its "One run at a time")
+.check-discriminating.lock
+
+# Per-seat Claude/OpenRig state (plugins, settings); never product code
+.claude/
+
+# TetGen output written when it refuses a PLC; scratch, never a commit.
+_skipped.*

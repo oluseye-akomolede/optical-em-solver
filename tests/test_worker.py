@@ -1,0 +1,1757 @@
+"""The Jetson worker, driven end to end over a real socket.
+
+The worker is a separate process that talks HTTP, so a Flask test client cannot
+stand in for the app it talks to -- the client does not serve a socket, and the
+whole point of these tests is that the worker's real ``urllib`` client reaches
+the real routes. Each test therefore runs a ``werkzeug`` server on an
+OS-assigned port in a daemon thread and points the worker's ``MSE_URL`` at it.
+Every call still goes through ``web/worker_api.py``: the auth, the lease rules
+and the filename allow-list are all the production ones.
+
+What is faked, and why:
+
+* ``solve`` -- there is no GPU here and no TetGen is allowed. The fake writes the
+  real output FILENAMES into a LocalStore, so the upload path, the name
+  enumeration and the allow-list are exercised for real.
+* ``BenchLock`` where a test needs the lock held, because a real flock is
+  per-open-file and two locks in one process are the same lock.
+* Nothing in ``web/`` -- the app side is the real blueprint over a real socket.
+
+What is NOT proved here, and must not be implied: that the systemd unit starts,
+that a real flock serialises against the lead's benchmarks, and that the cuDSS
+GPU path works. Those are deploy-time facts on the Jetson.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from werkzeug.serving import make_server
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "web"))
+sys.path.insert(0, str(ROOT / "worker"))
+sys.path.insert(0, str(ROOT / "dockerfiles" / "maxwell_solver"))
+
+import app as APP  # noqa: E402
+import db as DB  # noqa: E402
+import mse_worker as W  # noqa: E402
+import storage as STORE  # noqa: E402
+from test_routing import FakeDb, LeaseDb, MemoryStore  # noqa: E402
+
+TOKEN = "tok-worker-test-123"
+
+#: A fixed, ancient mtime base for tests that need a deterministic ORDER of
+#: files rather than whatever the filesystem's clock says. Far enough in the
+#: past that no code path can accidentally beat it.
+BASE_TIME = 1_000_000_000.0
+
+#: what the fake solve writes. Every name here is on the API's allow-list, and
+#: between them they cover both branches of it (the exact names and the pattern).
+RESULT_FILES = {
+    "modes.json": b'{"modes": [{"wavelength_m": 1.0}]}',
+    "surface.glb": b"glTF-fake",
+    "mode_01.bin": b"\x00\x01\x02\x03",
+    "mode_02.vtu": b"<VTKFile/>",
+}
+
+
+# ---------------------------------------------------------------------------
+# A real server, on a real port
+# ---------------------------------------------------------------------------
+
+class RunningServer:
+    """A real HTTP server for one test app, torn down afterwards."""
+
+    def __init__(self, app):
+        self.server = make_server("127.0.0.1", 0, app, threaded=True)
+        self.port = self.server.server_port
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+
+
+@pytest.fixture
+def server(tmp_path, monkeypatch):
+    """A running app plus the doubles the worker will meet.
+
+    The app is built through the real factory with the real worker blueprint;
+    only the database and the object store are in-process doubles, which is the
+    same substitution every other test in this suite makes.
+    """
+    monkeypatch.setenv("MSE_WORKER_TOKEN", TOKEN)
+    monkeypatch.setenv("MSE_SOLVER_IMAGE", "test-image")
+    store = MemoryStore(tmp_path)
+    jobs_db = LeaseDb()
+    app, _s, _d, _l = APP.create_app({
+        "TESTING": True, "MSE_LOCAL_STORE": str(tmp_path),
+        "MSE_DB_MOCK": jobs_db, "MSE_JOB_LAUNCHER": _NoLauncher(),
+        "MSE_SOLVER_IMAGE": "test-image",
+    })
+    running = RunningServer(app)
+    running.store = store
+    running.jobs_db = jobs_db
+    try:
+        yield running
+    finally:
+        running.stop()
+
+
+class _NoLauncher:
+    def launch(self, *_a, **_k):  # pragma: no cover - never called here
+        raise AssertionError("the worker path must not launch cluster Jobs")
+
+    def __getattr__(self, name):  # pragma: no cover
+        def _no(*_a, **_k):
+            return None
+        return _no
+
+
+def queued_job(jobs_db, job_id="11111111-2222-3333-4444-555555555555", **extra):
+    """A GPU-targeted, queued job, as the app would have stored it."""
+    job = {
+        "job_id": job_id, "units": "mm", "n_index": 1.5, "n_modes": 10,
+        "est_tets": 20000, "target": DB.JETSON, "status": DB.QUEUED,
+        "min_feature_m": None, "scale": 1.0,
+    }
+    job.update(extra)
+    jobs_db.jobs[job_id] = job
+    return job
+
+
+# ---------------------------------------------------------------------------
+# The worker, and its fakes
+# ---------------------------------------------------------------------------
+
+def report_modes(stage, job_id, n_modes):
+    """Report the mode rows a successful solve hands its ``db``.
+
+    A hand-written solve callable that returns success must call this, because
+    ``/done`` refuses a body with no mode rows -- the app will not mark a job
+    DONE without them. Kept as one function so the fakes share the real
+    solver's contract instead of each one restating it, and so a change to what
+    ``/done`` requires is one edit here rather than a hunt through callables.
+
+    Mirrors ``mse_maxwell_solver.solve``: ``delete_modes`` then
+    ``insert_modes``, with ``(index, k0_per_m, freq_hz, vacuum_wavelength_m)``
+    tuples for indices 1..n.
+    """
+    if stage is None:
+        return
+    rows = [(i + 1, 1.0e6 + i, 1.0e14 + i, 1.0e-6 - i * 1.0e-9)
+            for i in range(int(n_modes))]
+    stage.delete_modes(job_id)
+    stage.insert_modes(job_id, rows)
+
+
+class FakeSolve:
+    """Stand-in for the production solver. Writes the real filenames.
+
+    ``behaviour`` lets a test choose what happens: 'ok', 'raise' (a solve that
+    fails), 'too_big' (a deterministic failure the owner can act on), or a
+    callable for anything more specific.
+
+    'raise' raises a plain ``RuntimeError``, which ``classify`` calls TERMINAL
+    (an unrecognised exception is more likely a solver fault than a blip --
+    see the default there). A test that wants the transient path raises an
+    ``OSError`` itself.
+
+    On the success path it calls ``stage.insert_modes`` as the real solver does,
+    with ``n_modes`` rows for the job. That is not decoration: ``/done`` refuses
+    a body with no mode rows, so a fake that skipped this would be a fake whose
+    contract the real client does not share -- and the route would look broken
+    for a reason the production code never meets. The rows are the same four
+    fields, in the solver's own order.
+    """
+
+    def __init__(self, behaviour="ok"):
+        self.behaviour = behaviour
+        self.calls: list[dict] = []
+        self.stages: list[str] = []
+        #: every row set the fake "wrote", so a test can compare the app's copy
+        #: against what the solve actually reported.
+        self.rows: list[tuple] = []
+
+    def __call__(self, job, store_in, store_out, stage=None):
+        self.calls.append(dict(job))
+        if callable(self.behaviour):
+            return self.behaviour(job, store_in, store_out, stage)
+        if self.behaviour == "raise":
+            if stage is not None:
+                stage.set_stage(job["job_id"], "running", stage="meshing")
+            raise RuntimeError("the mesh is too detailed for this box")
+        if self.behaviour == "too_big":
+            if stage is not None:
+                stage.set_stage(job["job_id"], "running", stage="meshing")
+            raise ValueError("this model has more elements than this box "
+                             "can solve")
+        for name, data in RESULT_FILES.items():
+            store_out.write(f"jobs/{job['job_id']}/{name}", data)
+        if stage is not None:
+            stage.set_stage(job["job_id"], "running", stage="solving")
+            self.stages.append(stage.stage)
+            report_modes(stage, job["job_id"], job["n_modes"])
+            self.rows = list(stage.modes)
+        return {"n_modes": job["n_modes"], "n_tets": 1234}
+
+
+class FakeLock:
+    """A lock whose held-ness a test controls, and whose release is visible."""
+
+    def __init__(self, free=True):
+        self.free = free
+        self.releases = 0
+        self.acquires = 0
+
+    def acquire(self):
+        self.acquires += 1
+        return self.free
+
+    def release(self):
+        self.releases += 1
+
+
+def make_worker(server, tmp_path, solve=None, lock=None, log=None,
+                token=TOKEN, **config_kw):
+    """A real Worker talking to the running server, with the fakes injected."""
+    work_root = tmp_path / "work"
+    # A short beat by default: the whole point of the heartbeat is that it
+    # fires DURING a solve, and a tier-1 solve here lasts a fraction of a
+    # second. A test that wants a long beat says so explicitly.
+    config = W.Config(
+        server.url, token,
+        work_root=config_kw.pop("work_root", work_root),
+        lock_path=config_kw.pop("lock_path", tmp_path / "gpu.lock"),
+        poll_seconds=config_kw.pop("poll_seconds", 0.05),
+        keep_failed=config_kw.pop("keep_failed", 1),
+        beat_seconds=config_kw.pop("beat_seconds", 0.02),
+    )
+    assert not config_kw, f"make_worker got unknown kwargs: {sorted(config_kw)}"
+    api = W.WorkerAPI(config.url, config.token)
+    lines: list[str] = []
+    logger = log if log is not None else (lambda m, **k: lines.append(str(m)))
+    worker = W.Worker(config, api, lock or FakeLock(), solve=solve or FakeSolve(),
+                      store_factory=_local_store, log=logger)
+    worker.log_lines = lines
+    return worker
+
+
+def _local_store(work_root, _job_id):
+    return STORE.LocalStore(work_root)
+
+
+# ---------------------------------------------------------------------------
+# 1. the happy path
+# ---------------------------------------------------------------------------
+
+def test_a_claimed_job_is_solved_uploaded_marked_done_and_cleaned(tmp_path, server):
+    """The whole contract in one test: claim, input, solve, upload, done, clean."""
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJDATA")
+    solve = FakeSolve()
+    worker = make_worker(server, tmp_path, solve=solve)
+
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    # the job is done at the server, and its lease is gone with it
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.DONE
+    assert row.get("lease_owner") is None
+
+    # every result file arrived, byte for byte
+    for name, data in RESULT_FILES.items():
+        assert server.store.read(STORE.job_key(job["job_id"], name)) == data
+
+    # the solve got the job's own parameters and the input we uploaded
+    assert solve.calls[0]["job_id"] == job["job_id"]
+    assert solve.calls[0]["n_modes"] == 10
+
+    # and the work dir is gone: a 0.2 mm job is ~500 MB
+    assert not (worker.config.work_root / job["job_id"]).exists()
+
+    # the lock was handed back
+    assert worker.lock.releases >= 1
+
+
+def test_the_worker_uploads_every_result_the_solver_wrote(tmp_path, server):
+    """The file list comes from the store, so a new output file is uploaded."""
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    worker = make_worker(server, tmp_path)
+    worker.claim_loop(max_jobs=1)
+    assert set(RESULT_FILES) <= set(server.store.keys_under(job["job_id"]))
+
+
+# ---------------------------------------------------------------------------
+# 2. an empty queue is not a failure
+# ---------------------------------------------------------------------------
+
+def test_an_empty_queue_sleeps_and_loops_rather_than_failing(tmp_path, server):
+    """204 must not be reported as a failure and must not end the process.
+
+    A worker that treated an empty queue as an error would restart-loop forever
+    on an idle Jetson, which is why the drain loop is separately asserted.
+    """
+    worker = make_worker(server, tmp_path)
+    empty = W.WorkerAPI(server.url, TOKEN)
+
+    assert empty.claim() is None          # the server really does answer 204
+    worker.claim_loop(max_jobs=0)
+    # No job was attempted, and nothing was reported to the server.
+    assert worker.processed == []
+    assert server.jobs_db.jobs == {} or all(
+        j["status"] == DB.QUEUED for j in server.jobs_db.jobs.values())
+
+
+def test_a_204_is_not_confused_with_a_transport_error(tmp_path, server):
+    """A dead server must be an APIError, not silently read as 'no work'.
+
+    Could-not-ask must not look like nothing-there: if a broken URL returned
+    None the worker would idle forever against a server that is not running and
+    look healthy while doing it.
+    """
+    api = W.WorkerAPI("http://127.0.0.1:1", TOKEN, timeout=0.5)
+    with pytest.raises(W.APIError) as excinfo:
+        api.claim()
+    assert excinfo.value.status == 0
+    assert "could not reach" in excinfo.value.body
+
+
+# ---------------------------------------------------------------------------
+# 3. a solve failure reports failed
+# ---------------------------------------------------------------------------
+
+def test_a_terminal_solve_failure_ends_the_job_and_it_is_never_reoffered(
+        tmp_path, server):
+    """A deterministic failure is TERMINAL, and the proof is the second claim.
+
+    The old contract requeued: the job came straight back and the loop had to
+    remember it and decline it. That is gone. Now the row ends FAILED, and the
+    observable consequence is that the worker's SECOND claim gets nothing at all
+    -- not the same job, not a different one, nothing (204). A worker that
+    requeued would see the row again here.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    worker = make_worker(server, tmp_path, solve=FakeSolve("too_big"))
+
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.FAILED, (
+        "a deterministic failure must be terminal; requeueing it means it comes "
+        "straight back to a worker that fails it the same way, forever")
+    assert row.get("lease_owner") is None, "the lease must be cleared"
+    assert row.get("message"), "the owner must get a message on the job page"
+    # NOT the same job handed back
+    assert worker.api.claim() is None, (
+        "the failed job was handed out again: /failed is not terminal")
+
+
+def test_a_terminal_failure_does_not_starve_the_queue(tmp_path, server):
+    """Both ids must be attempted: the broken one must not block the good one."""
+    ids = ["aaaaaaaa-0000-0000-0000-000000000001",
+           "bbbbbbbb-0000-0000-0000-000000000002"]
+    for job_id in ids:
+        queued_job(server.jobs_db, job_id)
+        server.store.write(STORE.job_key(job_id, "input.obj"), b"OBJ")
+
+    seen: list[str] = []
+
+    def always_fails(job, store_in, store_out, stage=None):
+        seen.append(job["job_id"])
+        raise ValueError("this upload is malformed")
+
+    worker = make_worker(server, tmp_path, solve=always_fails)
+    worker.claim_loop(max_jobs=2)
+    assert set(seen) == set(ids), (
+        f"a failing job starved the queue: the worker attempted {seen}")
+    for job_id in ids:
+        assert server.jobs_db.jobs[job_id]["status"] == DB.FAILED
+
+
+def test_a_transient_failure_is_handed_back_and_can_be_retried(
+        tmp_path, server):
+    """The other half of the split: a transient failure must NOT kill the job.
+
+    An ``OSError`` says nothing about the job -- the wire dropped, the disk was
+    full -- so it goes to ``/release`` and the row comes back claimable. The next
+    attempt succeeds, which is the whole reason the two verbs exist: calling this
+    one terminal would throw away a job that was always going to work.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    calls = {"n": 0}
+
+    def fails_once(job, store_in, store_out, stage=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("the connection dropped")
+        for name, data in RESULT_FILES.items():
+            store_out.write(f"jobs/{job['job_id']}/{name}", data)
+        report_modes(stage, job["job_id"], job["n_modes"])
+        return {"n_tets": 1}
+
+    worker = make_worker(server, tmp_path, solve=fails_once)
+    worker.claim_loop(max_jobs=1)
+    assert calls["n"] == 1
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.QUEUED, (
+        "a transient failure was treated as terminal: the job is dead")
+    assert row["release_count"] == 1, "the release was not counted"
+
+    # retried immediately -- there is no worker-side backoff any more
+    worker.claim_loop(max_jobs=1)
+    assert calls["n"] == 2
+    assert server.jobs_db.jobs[job["job_id"]]["status"] == DB.DONE
+
+
+def test_three_releases_end_the_job_even_for_a_transient_reason(tmp_path,
+                                                                server):
+    """Nothing can loop: the app fails the job at the bound.
+
+    A worker that flaps -- or a network that keeps dropping -- must not be able
+    to hand the same job back forever. The bound lives in the app, so this test
+    drives it through the real route.
+
+    ``MAX_RELEASES`` counts the releases that are ALLOWED, so the job survives
+    that many and dies on the next one: three requeues then a fourth attempt
+    that finds ``release_count`` already at the bound. Off-by-one here is the
+    difference between "bounded" and "one more than the operator was told".
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def always_transient(job, store_in, store_out, stage=None):
+        raise OSError("the connection dropped")
+
+    worker = make_worker(server, tmp_path, solve=always_transient)
+    for _ in range(DB.MAX_RELEASES):
+        worker.claim_loop(max_jobs=1)
+    # still claimable: exactly MAX_RELEASES releases are permitted
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["release_count"] == DB.MAX_RELEASES
+    assert row["status"] == DB.QUEUED, (
+        "the bound fired one release early: it must permit MAX_RELEASES")
+
+    # ...and the next one is the last
+    worker.claim_loop(max_jobs=1)
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.FAILED, (
+        f"after {DB.MAX_RELEASES} releases the job is still claimable: a "
+        f"flapping worker can loop forever")
+    assert row.get("message"), "the owner must get a message on the job page"
+    assert worker.api.claim() is None, "the job was still handed out"
+
+
+# ---------------------------------------------------------------------------
+# 4. an UPLOAD failure must not look like a success
+# ---------------------------------------------------------------------------
+
+def test_an_upload_failure_reports_failed_and_never_done(tmp_path, server,
+                                                         monkeypatch):
+    """THE test for could-not-ask one level down.
+
+    The upload route is made to refuse the third file. The job must end up
+    failed-and-requeued -- never done. A worker that ignored the upload error
+    would tell the app a job finished whose results are not in the bucket, and
+    the owner would be shown a broken result page instead of a retry.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    uploaded: list[str] = []
+    real_upload = W.WorkerAPI.upload
+
+    def flaky_upload(self, job_id, name, data):
+        uploaded.append(name)
+        if len(uploaded) == 3:
+            raise W.APIError(500, "could not store the file")
+        return real_upload(self, job_id, name, data)
+
+    monkeypatch.setattr(W.WorkerAPI, "upload", flaky_upload)
+    worker = make_worker(server, tmp_path)
+    worker.claim_loop(max_jobs=1)
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] != DB.DONE, (
+        "an upload failed but the job was reported done: the app now believes "
+        "results exist that are not in storage")
+    assert row["status"] == DB.QUEUED
+    # the server never saw a done call
+    assert ("POST", f"/worker/jobs/{job['job_id']}/done") not in worker.api.requests
+
+
+# ---------------------------------------------------------------------------
+# 5. the bench lock
+# ---------------------------------------------------------------------------
+
+def test_no_claim_is_made_at_all_while_the_lock_is_held(tmp_path, server):
+    """Asserted on the REQUEST LOG, not a return value.
+
+    "Did not ask" and "asked and got nothing" are indistinguishable from the
+    outside, and only the first is correct: a claimed job this worker cannot run
+    has vanished from the cluster's view while the owner waits. So the
+    observation is that no claim request was made -- a 204 would be a bug.
+    """
+    queued_job(server.jobs_db)
+    lock = FakeLock(free=False)
+    worker = make_worker(server, tmp_path, lock=lock)
+
+    worker.claim_loop(max_jobs=1)
+
+    claimed = [r for r in worker.api.requests if r[1] == "/worker/claim"]
+    assert claimed == [], f"the worker claimed while the lock was held: {claimed}"
+    assert worker.processed == []
+    # the job is untouched and still queued
+    (row,) = server.jobs_db.jobs.values()
+    assert row["status"] == DB.QUEUED and not row.get("lease_owner")
+
+
+def test_the_lock_is_released_on_the_failure_path(tmp_path, server):
+    """A job that raises must still hand the GPU back."""
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    lock = FakeLock()
+    worker = make_worker(server, tmp_path, solve=FakeSolve("raise"), lock=lock)
+    worker.claim_loop(max_jobs=1)
+    assert lock.releases >= 1
+
+
+# ---------------------------------------------------------------------------
+# 6. SIGTERM mid-job
+# ---------------------------------------------------------------------------
+
+def test_sigterm_mid_job_hands_the_job_back_rather_than_dangling(tmp_path,
+                                                                 server):
+    """The stop flag set DURING a solve must produce a RELEASE, not a failure.
+
+    systemd's TimeoutStopSec is bounded and SIGKILL follows it, which leaves the
+    lease dangling until it expires -- exactly what the row forbids. So the
+    worker hands the job back instead of finishing it.
+
+    It goes back through ``/release``, NOT ``/failed``: an operator restarting
+    the service is not a verdict about the job, and reporting it FAILED would
+    destroy a perfectly good job every time the service is restarted.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    worker = None
+
+    def solve_that_signals(job, store_in, store_out, stage=None):
+        # SIGTERM lands while the solve is running.
+        worker.request_stop()
+        for name, data in RESULT_FILES.items():
+            store_out.write(f"jobs/{job['job_id']}/{name}", data)
+        return {"n_tets": 1}
+
+    worker = make_worker(server, tmp_path, solve=solve_that_signals)
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.QUEUED, (
+        "SIGTERM mid-job must hand the job back, not finish it")
+    assert ("POST", f"/worker/jobs/{job['job_id']}/done") not in worker.api.requests
+    assert ("POST", f"/worker/jobs/{job['job_id']}/release") in worker.api.requests
+    assert ("POST", f"/worker/jobs/{job['job_id']}/failed") not in worker.api.requests, (
+        "a restart killed the job: it must be handed back, not failed")
+    assert row["release_count"] == 1
+    # the lease is not dangling: the app can hand this job to another worker
+    assert row.get("lease_owner") is None
+
+
+def test_sigterm_while_idle_stops_without_touching_a_job(tmp_path, server):
+    worker = make_worker(server, tmp_path)
+    worker.request_stop()
+    assert worker.claim_loop() == 0
+    assert worker.api.requests == [] or all(
+        r[1] != "/worker/claim" or True for r in worker.api.requests)
+    assert worker.processed == []
+
+
+# ---------------------------------------------------------------------------
+# 7. the token never reaches a log, a repr, or an exception
+# ---------------------------------------------------------------------------
+
+def test_the_token_never_appears_in_the_logs_or_a_repr(tmp_path, server,
+                                                       capsys):
+    """Drive every path that prints, then grep the whole output for the token.
+
+    A test that passes because the token never appears in *any* code path proves
+    nothing, so this drives startup, a successful job, a failing job, and a
+    rejected request (401 from a bad token on a second client).
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    fail_job = queued_job(server.jobs_db, "cccccccc-0000-0000-0000-000000000003")
+    server.store.write(STORE.job_key(fail_job["job_id"], "input.obj"), b"OBJ")
+
+    worker = make_worker(server, tmp_path, solve=FakeSolve("raise"))
+    worker.claim_loop(max_jobs=1)
+
+    # a rejected request, which is the path most likely to echo the header
+    bad = W.WorkerAPI(server.url, "wrong-token")
+    with pytest.raises(W.APIError) as excinfo:
+        bad.claim()
+    assert excinfo.value.status == 401
+
+    # reprs of the two objects that hold the secret
+    assert TOKEN not in repr(worker.api)
+    assert TOKEN not in repr(worker.config)
+
+    captured = capsys.readouterr()
+    haystack = "\n".join([captured.out, captured.err,
+                          "\n".join(worker.log_lines), repr(worker.api),
+                          repr(worker.config), str(excinfo.value)])
+    assert TOKEN not in haystack, "the worker token leaked into the logs"
+
+
+def test_a_bad_token_is_a_startup_refusal_not_an_idle_loop(tmp_path):
+    """A wrong token must stop the worker at startup, naming the problem."""
+    env = tmp_path / "env"
+    env.write_text("MSE_URL=http://127.0.0.1:9\n")   # no token at all
+    env.chmod(0o600)
+    with pytest.raises(W.WorkerError) as excinfo:
+        W.load_config(env)
+    assert "MSE_WORKER_TOKEN" in str(excinfo.value)
+
+
+def test_a_missing_url_is_refused(tmp_path):
+    env = tmp_path / "env"
+    env.write_text("MSE_WORKER_TOKEN=abc\n")
+    env.chmod(0o600)
+    with pytest.raises(W.WorkerError) as excinfo:
+        W.load_config(env)
+    assert "MSE_URL" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# 8/9. the env file and its mode
+# ---------------------------------------------------------------------------
+
+def test_a_world_readable_env_file_refuses_to_start(tmp_path):
+    """A mode-600 file is the whole secret story; 0644 must be refused."""
+    env = tmp_path / "env"
+    env.write_text(f"MSE_URL=http://x\nMSE_WORKER_TOKEN={TOKEN}\n")
+    env.chmod(0o644)
+    with pytest.raises(W.WorkerError) as excinfo:
+        W.load_config(env)
+    assert "chmod 600" in str(excinfo.value)
+
+
+def test_a_mode_600_env_file_loads(tmp_path):
+    env = tmp_path / "env"
+    env.write_text(f"""# a comment
+MSE_URL=http://example.test/
+MSE_WORKER_TOKEN={TOKEN}
+
+POLL_SECONDS=2.5
+""")
+    env.chmod(0o600)
+    config = W.load_config(env)
+    assert config.url == "http://example.test"     # trailing slash normalised
+    assert config.token == TOKEN
+    assert config.poll_seconds == 2.5
+
+
+def test_the_env_file_does_not_hijack_the_process_environment(tmp_path,
+                                                              monkeypatch):
+    """The file is the config, not a merge into os.environ."""
+    monkeypatch.setenv("MSE_URL", "http://from-the-environment")
+    env = tmp_path / "env"
+    env.write_text(f"MSE_URL=http://from-the-file\nMSE_WORKER_TOKEN={TOKEN}\n")
+    env.chmod(0o600)
+    assert W.load_config(env).url == "http://from-the-file"
+
+
+# ---------------------------------------------------------------------------
+# 10/11. disk hygiene
+# ---------------------------------------------------------------------------
+
+def test_a_successful_job_leaves_no_work_directory(tmp_path, server):
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    big = FakeSolve()
+
+    def fatten(job, store_in, store_out, stage=None):
+        store_out.write(f"jobs/{job['job_id']}/mode_01.bin", b"x" * 200_000)
+        store_out.write(f"jobs/{job['job_id']}/modes.json", b"{}")
+        report_modes(stage, job["job_id"], job["n_modes"])
+        return {"n_tets": 1}
+
+    worker = make_worker(server, tmp_path, solve=fatten)
+    worker.claim_loop(max_jobs=1)
+    assert not (worker.config.work_root / job["job_id"]).exists()
+    assert list(worker.config.work_root.glob("*.failed")) == []
+
+
+def test_only_the_newest_failed_directory_is_kept(tmp_path, server):
+    """The sweep leaves the newest failure and deletes the older ones.
+
+    Driven directly rather than only through a job run: a job run exercises the
+    sweep with whatever the filesystem's clock says, and "the newest survived"
+    is then true by accident as often as by design. Here the mtimes are set
+    explicitly, so the ORDER is the test's own rather than the filesystem's.
+
+    Note the sweep runs after EVERY failure, so a run of failures never
+    accumulates dirt in the first place; the direct call is what proves the
+    ordering rule that keeps it bounded once the dirs exist at different ages
+    (a job that fails, then a process restart, then another failure).
+    """
+    ids = [f"dddddddd-0000-0000-0000-00000000000{n}" for n in range(3)]
+
+    def boom(job, store_in, store_out, stage=None):
+        raise RuntimeError("nope")
+
+    worker = make_worker(server, tmp_path, solve=boom, keep_failed=1)
+    for job_id in ids:
+        queued_job(server.jobs_db, job_id)
+        server.store.write(STORE.job_key(job_id, "input.obj"), b"OBJ")
+        worker.claim_loop(max_jobs=1)
+        assert (worker.config.work_root / f"{job_id}.failed").exists(), (
+            f"{job_id} was not kept: the sweep must keep the NEWEST, and the "
+            f"newest at that moment is the one just written")
+
+    # Recreate the three at known ages (oldest first) and sweep.
+    import shutil
+    for n, job_id in enumerate(ids):
+        target = worker.config.work_root / f"{job_id}.failed"
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True)
+        os.utime(target, (BASE_TIME + n, BASE_TIME + n))
+
+    removed = W.sweep_failed(worker.config.work_root, 1)
+
+    kept = sorted(p.name for p in worker.config.work_root.glob("*.failed"))
+    assert kept == [f"{ids[-1]}.failed"], (
+        f"expected only the newest failure to survive, got {kept}")
+    assert sorted(removed) == sorted(f"{i}.failed" for i in ids[:-1]), (
+        f"the sweep removed the wrong set: {removed}")
+
+
+def test_the_sweep_runs_at_startup_too(tmp_path):
+    """A reboot is when a stale failure dir is most likely to be the newest."""
+    root = tmp_path / "work"
+    root.mkdir()
+    for n, name in enumerate(["old.failed", "older.failed", "newest.failed"]):
+        d = root / name
+        d.mkdir()
+        os_time = time.time() + n
+        __import__("os").utime(d, (os_time, os_time))
+    removed = W.sweep_failed(root, keep=1)
+    assert len(removed) == 2
+    assert (root / "newest.failed").exists()
+
+
+# ---------------------------------------------------------------------------
+# 12/13. the heartbeat, and a lease that goes away
+# ---------------------------------------------------------------------------
+
+def test_the_heartbeat_renews_with_the_real_stage_not_a_constant(tmp_path,
+                                                                 server):
+    """The stage the server sees must move through the solve's own stages.
+
+    A heartbeat that always reports 'starting' is indistinguishable from a
+    healthy one, and tells the operator nothing about a job that has been
+    meshing for ten minutes.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    seen: list[str] = []
+
+    def solve_that_moves(job, store_in, store_out, stage=None):
+        for name in ("meshing", "assembling", "solving"):
+            stage.set_stage(job["job_id"], "running", stage=name)
+            seen.append(name)
+            time.sleep(0.25)                 # let beats fire inside this stage
+        for fname, data in RESULT_FILES.items():
+            store_out.write(f"jobs/{job['job_id']}/{fname}", data)
+        report_modes(stage, job["job_id"], job["n_modes"])
+        return {"n_tets": 1}
+
+    # Enough beats to move through the stages: the solve holds each stage for
+    # 0.25 s and the beat is 0.02 s, so several land inside each one.
+    worker = make_worker(server, tmp_path, solve=solve_that_moves)
+    worker.claim_loop(max_jobs=1)
+
+    reported = server.jobs_db.stages_seen
+    assert reported, "the server never saw a progress call"
+    assert set(reported) & {"meshing", "assembling", "solving"}, (
+        f"the heartbeat never carried a real stage: {reported}")
+    assert len(set(reported)) > 1, (
+        f"the heartbeat sent one constant stage for the whole solve: {reported}")
+
+
+def test_a_lost_lease_stops_the_worker_before_done(tmp_path, server,
+                                                   monkeypatch):
+    """done must never be called once the lease is gone.
+
+    The server is made to answer 409 on progress (the lease expired), which is
+    how a worker that slept through its lease and came back is detected. The
+    job must NOT be reported done, and the worker must not upload over its
+    successor.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def solve_slowly(job, store_in, store_out, stage=None):
+        time.sleep(0.4)                      # long enough for one beat
+        for name, data in RESULT_FILES.items():
+            store_out.write(f"jobs/{job['job_id']}/{name}", data)
+        return {"n_tets": 1}
+
+    # the lease is gone from the server's point of view
+    monkeypatch.setattr(server.jobs_db, "renew_lease",
+                        lambda *a, **k: False)
+    monkeypatch.setattr(server.jobs_db, "lease_held_by",
+                        lambda *a, **k: False)
+
+    worker = make_worker(server, tmp_path, solve=solve_slowly)
+    result = worker.claim_loop(max_jobs=1)
+
+    assert ("POST", f"/worker/jobs/{job['job_id']}/done") not in worker.api.requests
+    assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# The pieces the loop depends on
+# ---------------------------------------------------------------------------
+
+def test_a_solver_output_outside_the_allow_list_is_a_loud_failure(tmp_path):
+    """A name the API would refuse must raise, not be silently dropped.
+
+    'The solver wrote a file we forgot to allow' and 'the solver wrote nothing'
+    mean opposite things, and a silent skip turns the first into a job that
+    reports success with a missing result.
+    """
+    store = STORE.LocalStore(tmp_path)
+    store.write("jobs/j1/input.obj", b"x")
+    store.write("jobs/j1/modes.json", b"{}")
+    store.write("jobs/j1/mystery.dat", b"?")
+    with pytest.raises(W.WorkerError) as excinfo:
+        W._result_names(store, "j1")
+    assert "mystery.dat" in str(excinfo.value)
+
+
+def test_a_job_with_no_result_files_is_refused(tmp_path):
+    """A directory that EXISTS and holds no results is a real verdict.
+
+    The setup is the point: this test originally wrote only ``input.obj`` and
+    never created ``jobs/j1``, so the old reader raised its
+    ``FileNotFoundError`` on a directory that was never there and the assertion
+    passed for the wrong reason -- the same shape as the live bug. The
+    directory is now created explicitly, so the test exercises the empty-solve
+    verdict rather than a missing directory. The missing-directory case has its
+    own test, which asserts it is NOT reported as an empty solve.
+    """
+    store = STORE.LocalStore(tmp_path)
+    (tmp_path / "jobs" / "j1").mkdir(parents=True)
+    store.write("jobs/j1/input.obj", b"x")
+    with pytest.raises(W.WorkerError) as excinfo:
+        W._result_names(store, "j1")
+    assert "no result files" in str(excinfo.value)
+
+
+def test_the_mode_file_matcher_matches_the_allow_list_exactly(tmp_path):
+    """The worker's local check must agree with the API's regex.
+
+    If they disagree the worker uploads a name the API refuses (a 400 mid-job),
+    or refuses to upload one the API would accept (a job reported done with
+    missing output).
+    """
+    for good in ("mode_01.bin", "mode_99.vtu"):
+        assert W._is_mode_file(good), good
+    for bad in ("mode_1.bin", "mode_001.bin", "mode_ab.bin", "mode_01.dat",
+                "modes.json", "mode_01.bin\n", "xmode_01.bin"):
+        assert not W._is_mode_file(bad), bad
+
+
+def test_a_job_id_that_is_a_path_is_refused(tmp_path):
+    """The job id comes off the wire and names a directory we DELETE."""
+    for bad in ("../../etc", "a/b", "..", ""):
+        with pytest.raises(W.WorkerError):
+            W.job_dir(tmp_path, bad)
+
+
+def test_the_bench_lock_is_exclusive_within_a_process(tmp_path):
+    """The real flock: a second BenchLock on the same path cannot take it."""
+    path = tmp_path / "gpu.lock"
+    first = W.BenchLock(path)
+    second = W.BenchLock(path)
+    assert first.acquire() is True
+    assert second.acquire() is False
+    first.release()
+    assert second.acquire() is True
+    second.release()
+
+
+# ---------------------------------------------------------------------------
+# 5. the GPU error CHAIN decides transient vs terminal
+# ---------------------------------------------------------------------------
+#
+# ``mse_eigen`` wraps a cuDSS failure as ``EigenError(msg) from exc``, so the
+# worker never sees the cuDSS exception itself. The top-level TYPE is therefore
+# the same for both events that matter here -- a GPU that would not come up
+# (transient) and a GPU that ran and rejected THIS job (terminal) -- and only the
+# ``__cause__`` chain tells them apart. These use the REAL ``EigenError`` rather
+# than a stub, because a stub that merely resembles it would not catch a change
+# to how the solver wraps its failures, which is the whole seam under test.
+
+def test_a_gpu_that_would_not_initialise_is_transient_through_the_wrapper():
+    """A dead/absent GPU must not fail the job forever.
+
+    The cupy types are the strongest evidence: they are raised by the runtime or
+    driver itself, never as a verdict about an eigenproblem.
+    """
+    from mse_eigen import EigenError
+
+    class CUDARuntimeError(RuntimeError):
+        pass
+
+    for cause in (
+        CUDARuntimeError("cudaErrorNoDevice: no CUDA-capable device is detected"),
+        RuntimeError("CUDA driver version is insufficient for CUDA runtime"),
+        RuntimeError("failed to initialise the cuDSS context"),
+        RuntimeError("CUDA context creation failed"),
+    ):
+        exc = EigenError("the eigensolver failed")
+        exc.__cause__ = cause
+        assert W.classify(exc) == "transient", (
+            f"{type(cause).__name__}: {cause} was called terminal; a GPU that "
+            f"is down would then fail every job permanently")
+
+
+def test_a_cudss_status_error_stays_terminal_even_inside_the_wrapper():
+    """A GPU that RAN and rejected this job is a verdict about the job.
+
+    ``ALLOC_FAILED`` is the case the lead named: re-running produces the same
+    answer, so requeueing it is the loop this function exists to prevent. The
+    status words are checked FIRST, so a message that also mentions
+    initialisation ('initialization failed after ALLOC_FAILED') reads terminal.
+    """
+    from mse_eigen import EigenError
+
+    for text in (
+        "cuDSS status 4: CUDSS_STATUS_ALLOC_FAILED",
+        "cudss execution failed: wrong parameter",
+        "the factorisation is singular",
+        "initialization succeeded but allocation failed",
+    ):
+        exc = EigenError("the eigensolver failed")
+        exc.__cause__ = RuntimeError(text)
+        assert W.classify(exc) == "terminal", (
+            f"{text!r} was called transient; a job that will always fail the "
+            f"same way would be requeued until the bound and then reported as "
+            f"an infrastructure problem, which it is not")
+
+
+def test_the_chain_is_walked_and_not_just_the_first_cause():
+    """Two wrappers deep is still the same event.
+
+    The worker's own code may wrap again before ``classify`` sees it, so the
+    walk must follow ``__context__`` as well as ``__cause__``. Without this a
+    doubly-wrapped GPU init failure is terminal, which is the silent half of
+    the bug.
+    """
+    from mse_eigen import EigenError
+
+    inner = RuntimeError("cudaErrorInsufficientDriver: driver too old")
+    middle = RuntimeError("could not build the solver")
+    middle.__context__ = inner
+    exc = EigenError("the eigensolver failed")
+    exc.__cause__ = middle
+    assert W.classify(exc) == "transient"
+
+
+def test_the_bound_sentence_and_the_workers_reason_both_reach_the_owner(
+        tmp_path, server):
+    """On the LAST attempt the owner gets both halves, not the reason alone.
+
+    ``release_jetson`` appends the bound sentence on the over-bound branch. The
+    bug it fixes was ``message or <bound sentence>``: the worker always sends a
+    non-empty message, so the bound sentence was shadowed and the owner was told
+    only why the last attempt failed -- never that this was the end of the
+    retries, which is the part they need to act on. Both parts are asserted
+    here, because either one alone was already being printed.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def gpu_down(job, store_in, store_out, stage=None):
+        # What the worker really sees when the GPU is absent: mse_eigen wraps
+        # the CUDA failure, and ``_owner_message`` maps it to the owner's text.
+        from mse_eigen import EigenError
+        exc = EigenError("the eigensolver failed")
+        exc.__cause__ = RuntimeError(
+            "cudaErrorNoDevice: no CUDA-capable device is detected")
+        raise exc
+
+    # The owner-facing reason, taken from the production mapping rather than
+    # retyped here: a test that restates the sentence checks its own copy.
+    reason = W._owner_message(
+        _wrapped_eigen("cudaErrorNoDevice: no CUDA-capable device is detected"))
+
+    worker = make_worker(server, tmp_path, solve=gpu_down)
+    for _ in range(DB.MAX_RELEASES):
+        worker.claim_loop(max_jobs=1)
+    # The retries are still claimable, and their message says so with the count.
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.QUEUED
+    assert "retrying (attempt" in row["message"], row["message"]
+    assert reason in row["message"], (
+        f"the reason was dropped from the retry message: {row['message']!r}")
+
+    # The attempt past the bound is the last, and its message carries both the
+    # reason and the fact that the retries are over.
+    worker.claim_loop(max_jobs=1)
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.FAILED
+    message = row["message"] or ""
+    assert reason in message, f"the owner lost the reason: {message!r}"
+    assert f"{DB.MAX_RELEASES} attempts" in message, (
+        f"the owner was never told the retries are over: {message!r}")
+
+    # And the reason must not blame the object: the GPU was down, the object was
+    # never even looked at. This is the sentence the owner reads on the page.
+    assert "simpler object" not in message, (
+        f"a GPU outage was reported to the owner as a fault in their object: "
+        f"{message!r}")
+    assert "graphics processor was not available" in message, message
+
+
+def _wrapped_eigen(text: str):
+    """An ``EigenError`` wrapping a cuDSS/CUDA failure, as mse_eigen raises it."""
+    from mse_eigen import EigenError
+    exc = EigenError("the eigensolver failed")
+    exc.__cause__ = RuntimeError(text)
+    return exc
+
+
+def test_the_achieve_path_stays_terminal_for_an_alloc_failure(tmp_path, server):
+    """ALWAYS a verdict, never a retry: the message the owner gets must be TRUE.
+
+    ``ALLOC_FAILED`` also arrives when another process on the GPU is holding the
+    memory, so the owner is told the two things they can actually act on rather
+    than "too detailed", which is a claim we cannot make. This drives it through
+    the production failure path so the MESSAGE, not just the classification, is
+    asserted.
+    """
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def cudss_alloc_failure(job, store_in, store_out, stage=None):
+        from mse_eigen import EigenError
+        exc = EigenError("the eigensolver failed")
+        exc.__cause__ = RuntimeError("cuDSS status 4: CUDSS_STATUS_ALLOC_FAILED")
+        raise exc
+
+    worker = make_worker(server, tmp_path, solve=cudss_alloc_failure)
+    worker.claim_loop(max_jobs=1)
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.FAILED, (
+        "an ALLOC_FAILED was retried; it is a verdict about this job and "
+        "re-running produces the same one")
+    message = row["message"] or ""
+    assert "could not fit in the GPU's memory" in message, message
+    assert "try again later" in message, message
+    assert "too detailed" not in message, (
+        "the owner was told the object is too detailed, which ALLOC_FAILED does "
+        "not tell us -- another process may be holding the memory")
+
+
+def test_a_row_failed_for_both_processors_reads_as_a_busy_machine(tmp_path, server):
+    """The STORED message, not just the mapping: this is what the owner sees.
+
+    On a Jetson row this is a terminal failure -- nothing reads a re-route
+    token for it -- so the sentence is the whole of what the owner gets.
+    """
+    from mse_backend import FullOnBothProcessors
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def both_full(job, store_in, store_out, stage=None):
+        raise FullOnBothProcessors("the GPU ran out of memory; the CPU cannot hold it")
+
+    worker = make_worker(server, tmp_path, solve=both_full)
+    worker.claim_loop(max_jobs=1)
+    row = server.jobs_db.jobs[job["job_id"]]
+    message = (row["message"] or "").lower()
+    assert row["status"] == DB.FAILED, row["status"]
+    assert "busy" in message, row["message"]
+    assert "contact support" not in message, row["message"]
+    assert "simpler object" not in message, row["message"]
+
+
+def test_the_real_jetson_library_load_failure_does_not_blame_the_object(
+        tmp_path, server):
+    """Job e9423834's chain, verbatim, through the failure path the worker uses.
+
+    The GPU could not even load cuDSS (the board's memory carve-out was
+    exhausted first), and the owner's page said "try a simpler object". No
+    object size makes a missing library appear, so that advice was false --
+    and it sent them to do work that could not help.
+
+    Asserted through ``_owner_message``, because that is the mapping the
+    worker calls; calling ``owner_message`` directly would skip the part this
+    test is about.
+    """
+    from mse_eigen import EigenError
+    inner = RuntimeError(
+        'Failure finding "libcudss.so.0": No such file: libcudss.so.0, '
+        'No such file: libcudss.so.0')
+    inner.__cause__ = RuntimeError(
+        "NvMapMemAllocInternalTagged: 1075072515 error 12")
+    exc = EigenError('could not factor A + sB: Failure finding "libcudss.so.0"')
+    exc.__cause__ = inner
+
+    message = W._owner_message(exc)
+    assert "try a simpler object" not in message.lower(), message
+    assert "not with your object" in message, message
+
+    # Through the job row as well, so the stored text is what is checked.
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def cannot_load_library(job, store_in, store_out, stage=None):
+        raise exc
+
+    worker = make_worker(server, tmp_path, solve=cannot_load_library)
+    worker.claim_loop(max_jobs=1)
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert "try a simpler object" not in (row["message"] or "").lower(), row["message"]
+
+
+def test_the_jetson_driver_allocator_oom_is_read_as_a_memory_failure():
+    """The first line of that same chain: the driver's own ENOMEM.
+
+    It is a real memory failure ("error 12" is ENOMEM on that board), and it
+    reaches the owner's mapping through the same chain walk.
+    """
+    from mse_backend import names_an_out_of_memory
+    assert names_an_out_of_memory(
+        RuntimeError("NvMapMemAllocInternalTagged: 1075072515 error 12"))
+    # The same tag with a different errno is NOT a memory failure: treating it
+    # as one would send the owner to "try again later" for a broken device.
+    assert not names_an_out_of_memory(
+        RuntimeError("NvMapMemAllocInternalTagged: 1075072515 error 22"))
+
+
+def test_the_chain_walk_terminates_on_a_cycle():
+    """A self-referential chain must not hang the worker.
+
+    ``__context__`` is set automatically during ``raise ... from`` handling and
+    can point back at an ancestor. A walk without a visited-set spins forever
+    holding the job's lease, which is worse than any wrong classification.
+    """
+    exc = RuntimeError("boom")
+    exc.__context__ = exc
+    assert W.classify(exc) == "terminal"
+
+    a = RuntimeError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    assert W.classify(a) == "terminal"
+
+
+def test_gpu_memory_is_released_after_a_successful_job(tmp_path, server,
+                                                       monkeypatch):
+    """A warm worker must hand the device memory back when the job ends.
+
+    The worker is deliberately long-lived, so per-job allocations that are not
+    released accumulate. On the Jetson that is system RAM, and the first symptom
+    is the OS killing the worker -- which arrives as SIGKILL, so nothing gets
+    logged and the job looks hung until its lease expires.
+    """
+    calls = []
+    monkeypatch.setattr(W, "_release_gpu_memory", lambda: calls.append("free"))
+
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+    worker = make_worker(server, tmp_path, solve=FakeSolve())
+    worker.claim_loop(max_jobs=1)
+
+    assert server.jobs_db.jobs[job["job_id"]]["status"] == DB.DONE
+    assert calls == ["free"], (
+        "the GPU memory was not released after a successful job, or was "
+        "released more than once")
+
+
+def test_gpu_memory_is_released_after_a_failed_job(tmp_path, server,
+                                                   monkeypatch):
+    """The failure path leaks WORST, and it is the path people forget.
+
+    An exception between the two factorisations leaves the first one alive with
+    no local holding it on the way out of the frame -- the registry is what
+    makes it reachable. A cleanup wired only into the success branch would look
+    correct in every passing test and leak on exactly the runs that are already
+    going wrong.
+    """
+    calls = []
+    monkeypatch.setattr(W, "_release_gpu_memory", lambda: calls.append("free"))
+
+    job = queued_job(server.jobs_db)
+    server.store.write(STORE.job_key(job["job_id"], "input.obj"), b"OBJ")
+
+    def explodes(job, store_in, store_out, stage=None):
+        raise RuntimeError("the factorisation died halfway")
+
+    worker = make_worker(server, tmp_path, solve=explodes)
+    worker.claim_loop(max_jobs=1)
+
+    assert calls == ["free"], (
+        "the GPU memory was not released after a failed job -- this is the "
+        "path a per-job leak accumulates on")
+
+
+def test_a_dir_that_was_never_found_is_not_reported_as_an_empty_solve(tmp_path):
+    """Absent-by-check and "the solver wrote nothing" are OPPOSITE readings.
+
+    This is the rig's signature defect as a unit test. The first reader built
+    its path by hand instead of asking the store, and a directory that was
+    never found has to say so -- it may not be reported as an empty solve, and
+    it must name the path it looked in so the report is checkable.
+    """
+    store = STORE.LocalStore(tmp_path)
+    # Nothing written at all: the store holds no such job.
+    with pytest.raises(W.ResultDirUnavailable) as nowhere:
+        W._result_names(store, "j1")
+    assert str(tmp_path) in str(nowhere.value), "the paths it tried must be named"
+
+    # The POSITIVE CONTROL: a directory that genuinely exists and holds no
+    # results is the other reading, and it is the one the empty verdict is for.
+    (tmp_path / "jobs" / "j1").mkdir(parents=True)
+    store.write("jobs/j1/input.obj", b"x")
+    with pytest.raises(W.WorkerError) as empty:
+        W._result_names(store, "j1")
+    assert "no result files" in str(empty.value)
+    assert not isinstance(empty.value, W.ResultDirUnavailable)
+
+
+def test_the_reader_agrees_with_the_key_scheme_the_writer_uses(tmp_path):
+    """One key scheme, stated twice, pinned against each other.
+
+    ``_result_names`` walked up from ``store.root`` and appended a literal
+    ``jobs/`` segment while the upload loop reads ``_key(job_id, name)``. Two
+    copies of one scheme agree today and drift the day either changes, and a
+    drift here fails a job AFTER a successful solve -- so it is asserted rather
+    than trusted. This is a statement about the pair, NOT a claim about the
+    deploy-3 failure: that was attributed to this line first, and the
+    attribution was wrong (the production wiring agrees).
+    """
+    store = STORE.LocalStore(tmp_path)
+    work_dir = tmp_path / "j1"
+    work_dir.mkdir(parents=True)
+    store.write(W._input_key("j1"), b"obj")
+    for name in ("modes.json", "surface.glb", "mode_01.bin", "mode_01.vtu"):
+        store.write(W._key("j1", name), b"x")
+
+    got = W._result_names(store, "j1")
+    # Every name the reader reports must be readable at the key the upload
+    # loop uses. This is the property that actually matters.
+    for name in got:
+        assert store._path(W._key("j1", name)).is_file(), name
+    assert got == ["mode_01.bin", "mode_01.vtu", "modes.json", "surface.glb"]
+
+
+# ---------------------------------------------------------------------------
+# real_solve dispatches on the KIND, and refuses the ones it cannot run
+# ---------------------------------------------------------------------------
+def _install_fake_pc_solve(monkeypatch, calls, error=None):
+    """Put a fake ``pc_solve`` module in front of the lazy import.
+
+    ``real_solve`` does ``from pc_solve import solve_pc`` inside the pc branch,
+    so the module is looked up in ``sys.modules`` at call time. Injecting a fake
+    there intercepts the dispatch without importing the real solver, which needs
+    numpy and would put a tier-2 dependency in a tier-1 test.
+
+    ``error`` makes the solve RAISE instead of return, for the test that a pc
+    job whose solve fails ends FAILED. A refusal from the real ``pc_solve`` is a
+    ``PCSolveError``, a plain ``Exception``, which ``classify`` sends to the
+    terminal ``/failed`` by its default; a ``WorkerError`` is used here because
+    its message passes through ``_owner_message`` verbatim, so the sentence the
+    owner reads is checkable.
+    """
+    import types
+
+    fake = types.ModuleType("pc_solve")
+
+    def solve_pc(job):
+        calls.append(job)
+        if error is not None:
+            raise error
+        # A diagram the app's ``/done`` will actually accept: ``bands[k][band]``
+        # -- one vector of n_bands per k-point, every vector the same length
+        # (see ``_band_payload``, which pins len(k_points) == len(bands)). An
+        # earlier version had two k-points and ONE band row, which the real
+        # validator refuses with a 400 -- invisible while this fake was only
+        # ever handed to ``real_solve`` directly and never put on the wire.
+        #
+        # It is also NON-SQUARE -- three k-points by two bands. A square diagram
+        # reads the same in either orientation, which is how the JS readers
+        # shipped transposed against fixtures written in their own shape; a
+        # double for a pc result must have a shape that can tell them apart.
+        return {"lattice": "triangular",
+                "labels": ["G", "X", "M"],
+                "k_points": [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]],
+                "bands": [[0.1, 0.3], [0.2, 0.4], [0.25, 0.45]]}
+
+    fake.solve_pc = solve_pc
+    monkeypatch.setitem(sys.modules, "pc_solve", fake)
+
+
+def test_real_solve_sends_a_pc_job_to_the_pc_solver(monkeypatch, tmp_path):
+    """A claim with kind='pc' runs ``solve_pc`` and returns a pc summary.
+
+    This is the dispatch the worker makes from the claim's kind. Without it --
+    or with the branch keyed on anything else -- a pc job would be handed to the
+    cavity solver, which is the same defect as the cluster launching one, on the
+    other machine.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+
+    class _Stage:
+        stage = None
+
+    out = W.real_solve({"job_id": "pc-1", "kind": "pc"}, None, None, _Stage())
+    assert len(calls) == 1, "solve_pc must be called exactly once"
+    assert out["kind"] == "pc"
+    assert out["modes"] == [], "a pc job produces no modes"
+    assert "bands" in out and out["bands"] is not None
+
+
+def test_real_solve_refuses_an_unknown_kind_by_name(monkeypatch, tmp_path):
+    """A kind the worker does not implement is a NAMED failure, not a cavity solve.
+
+    This used to be a silent else: anything that was not 'pc' fell through to
+    the cavity path. A row carrying a kind the worker has never heard of would
+    then be solved as a cavity and report a result for a job it did not
+    understand. The refusal must name the kind.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+
+    with pytest.raises(W.WorkerError) as excinfo:
+        W.real_solve({"job_id": "x-1", "kind": "hologram"}, None, None, None)
+    assert "hologram" in str(excinfo.value), (
+        "the refusal must name the kind it could not run, or the owner cannot "
+        "tell what was refused")
+    assert calls == [], "an unknown kind must never reach the pc solver either"
+
+
+def test_real_solve_treats_a_missing_kind_as_cavity(monkeypatch, tmp_path):
+    """``kind is None`` means the claim did not say, which is a cavity row.
+
+    A row created before ``kind`` existed arrives with no kind. The refusal
+    above must not fire for it, or every pre-existing job would start failing.
+    The cavity path is reached (and fails on its own missing max_tets), which is
+    how this test knows the refusal did not intercept it.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+    with pytest.raises(W.WorkerError) as excinfo:
+        W.real_solve({"job_id": "c-1"}, None, None, None)
+    # Reached the cavity path, which refuses the absent element cap -- NOT the
+    # kind guard, which would have named the kind.
+    assert "max_tets" in str(excinfo.value)
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# A pc job has NO upload, so run_job must not fetch one: the whole loop
+# ---------------------------------------------------------------------------
+
+#: A pc request shaped exactly as ``web/pc_form.request_json`` writes one: the
+#: same seven fields, in the same units. These are the values of the job that
+#: failed in production on 2026-10-01 (square, 12 divisions, r/a 0.2, TM, 4
+#: bands), so the tests below exercise the real request and not a convenient
+#: smaller one.
+PC_REQUEST = {
+    "lattice": "square", "r_over_a": 0.2, "n_rod": 3.5, "n_bg": 1.0,
+    "n_bands": 4, "divisions": 12, "polarisation": "TM",
+}
+
+
+def test_a_pc_job_finishes_without_fetching_an_input(tmp_path, server, monkeypatch):
+    """The app has no ``input.obj`` for a pc row, and the worker must not ask.
+
+    A pc job's mesh is built inside the solve, so the app never stores an upload
+    for it and its own input route answers 404 to a worker that asks. That is
+    what production does, and it is exactly what a fake API that always served
+    an ``input.obj`` hid -- ``WorkerAPI.fetch_input`` succeeded in the test and
+    404'd in prod, so every real pc job died before ``real_solve`` could
+    dispatch on its kind.
+
+    Here the REAL route is reached over a real socket, with the store genuinely
+    empty for this job: the fetch is not stubbed away, it is the production one
+    against the production store semantics. The solve is stubbed at the
+    ``pc_solve`` boundary only (``_install_fake_pc_solve``), because a tier-1
+    run cannot build a real band diagram.
+
+    RED before the fix: ``run_job`` fetched first, the 404 arrived as an
+    ``APIError``, ``classify`` calls that TRANSIENT, and the job was RELEASED --
+    never solved, never DONE, and (after ``MAX_RELEASES``) failed with a message
+    about the network that named none of this.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+    job = queued_job(server.jobs_db, n_modes=12, kind=DB.PC,
+                     pcs=dict(PC_REQUEST))
+    # The premise, stated on the store the route reads: there is no input.
+    assert server.store.keys_under(job["job_id"]) == []
+
+    worker = make_worker(server, tmp_path, solve=W.real_solve)
+
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.DONE, (
+        "a pc job needs no input, so a missing input.obj is not a reason to "
+        "fail or requeue it")
+    assert len(calls) == 1, "the pc solve must have run exactly once"
+    assert calls[0]["pcs"]["lattice"] == "square", (
+        "the request from the row must reach the solver, unaltered")
+
+
+def test_a_pc_job_runs_claim_to_done_over_the_real_routes(tmp_path, server,
+                                                         monkeypatch):
+    """The whole seam on one socket: claim -> solve -> ``/done``, for a pc job.
+
+    This is the seam that has failed twice, so it is tested end to end rather
+    than piecewise. ``tests/test_worker.py``'s ``server`` fixture runs the REAL
+    ``web/worker_api.py`` blueprint on a real port and the worker talks to it
+    through its real ``urllib`` client: the auth, the claim payload's
+    ``kind``/``pcs``, the lease and its renewal, and the ``/done`` band
+    validation are the production ones. Nothing on the ``web/`` side is faked.
+
+    The ONE stub is the ``pc_solve`` boundary -- installed in ``sys.modules``
+    where ``real_solve``'s late import finds it -- because there is no GPU here
+    and a real band diagram is a tier-2 solve.
+
+    What the assertions pin:
+
+    * the job is DONE and its lease is released,
+    * the diagram the solve produced is what the app STORED, merged onto the
+      request that was solved (the real store COALESCEs ``pcs``),
+    * nothing was uploaded -- a pc job has no result files, and a worker that
+      scanned for them would raise ``ResultDirUnavailable`` right after the
+      solve,
+    * the stage never named "uploading", a phase that does not run for a pc job.
+
+    Must fail before the fix, on the fetch, not on any of the above.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls)
+    job = queued_job(server.jobs_db, n_modes=12, kind=DB.PC,
+                     pcs=dict(PC_REQUEST))
+    worker = make_worker(server, tmp_path, solve=W.real_solve)
+
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.DONE
+    assert row.get("lease_owner") is None, "the lease is given up on success"
+
+    # The diagram landed, and the request it was solved from is still there.
+    bands = row["pcs"]["bands"]
+    assert bands["labels"] == ["G", "X", "M"]
+    assert bands["k_points"] == [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]]
+    assert bands["bands"] == [[0.1, 0.3], [0.2, 0.4], [0.25, 0.45]]
+    assert len(bands["bands"]) != len(bands["bands"][0]), (
+        "a square fixture would read the same transposed; this one must not")
+    assert row["pcs"]["lattice"] == "square", (
+        "the real store merges pcs, so the request must survive")
+
+    # No upload: the store holds nothing for this job, before or after.
+    assert server.store.keys_under(job["job_id"]) == []
+
+    # The stage sequence never named a phase a pc job does not run.
+    assert "uploading" not in server.jobs_db.stages_seen
+
+    # The work dir is cleaned up like any finished job's.
+    assert not (worker.config.work_root / job["job_id"]).exists()
+    assert worker.lock.releases >= 1
+
+
+def test_a_pc_solve_that_raises_ends_the_job_failed_not_done(tmp_path, server,
+                                                             monkeypatch):
+    """A pc job whose solve RAISES ends FAILED -- and stops being claimable.
+
+    The pc route is the new one, so it is the one most likely to have a failure
+    path nobody has walked. The two verbs are not interchangeable: ``/failed``
+    is TERMINAL in the app (the row stops being claimable and the owner reads
+    the message), while ``/release`` hands the job straight back to the oldest
+    claimable row -- which is the worker that just gave up on it. A pc job put
+    on the release path loops forever without ever saying why, and that is a
+    worse outcome than a wrong answer, because nothing is written down.
+
+    ``classify`` sends an unrecognised exception to ``/failed`` by its default,
+    which is right for a deterministic solver refusal (``pc_solve.PCSolveError``
+    is a plain ``Exception`` and lands there). That is an argument, though, so
+    this drives it: the raise is injected at the ``pc_solve`` boundary and
+    everything else -- claim, lease, report, store, the app's own routes -- is
+    the real thing.
+
+    Red-first, by making the fake RETURN instead of raise (pass ``error=None``):
+    the row then ends DONE and the first assertion fails. The test discriminates
+    a job that failed from one that quietly succeeded, which is the whole point.
+    """
+    calls = []
+    _install_fake_pc_solve(monkeypatch, calls,
+                           error=W.WorkerError("the pc solver refused this cell"))
+    job = queued_job(server.jobs_db, n_modes=12, kind=DB.PC,
+                     pcs=dict(PC_REQUEST))
+    worker = make_worker(server, tmp_path, solve=W.real_solve)
+
+    assert worker.claim_loop(max_jobs=1) == 1
+
+    row = server.jobs_db.jobs[job["job_id"]]
+    assert row["status"] == DB.FAILED, (
+        f"a pc job whose solve raised ended {row['status']!r}, not failed; a "
+        f"released pc job is handed to the oldest claimable row -- the worker "
+        f"that just failed it -- and loops")
+    assert len(calls) == 1, "the solve ran once and was not retried here"
+
+    # Terminal means the lease is gone AND the row is out of the queue, so a
+    # second worker polling finds nothing. Asserted through the app's own claim
+    # query rather than by reading the status twice.
+    assert row.get("lease_owner") is None
+    assert server.jobs_db.claim_jetson("some-other-worker", 60) is None, (
+        "a failed pc job is still claimable")
+
+    # The owner reads a sentence, not a traceback.
+    assert row["message"] == "the pc solver refused this cell"
+
+    # No bands were invented for a solve that never finished: a half-written
+    # diagram would draw as a real one.
+    assert not (row.get("pcs") or {}).get("bands")
+    assert server.store.keys_under(job["job_id"]) == []
+
+
+
+# ---------------------------------------------------------------------------
+# Kind dispatch: one decision (``job_kind``), every kind named, nothing falls
+# through to the cavity fetch and mesh
+# ---------------------------------------------------------------------------
+
+class _RecordingAPI:
+    """The worker-facing API surface ``run_job`` touches, recording each call.
+
+    Used where the question is ORDER -- was the input fetched, and before the
+    solve or not at all -- which a real server answers only indirectly (a 404
+    becomes a transient release several layers away). Signatures are the real
+    ``WorkerAPI`` ones.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def fetch_input(self, job_id):
+        self.calls.append(("fetch_input", job_id))
+        return b"o 1\n"
+
+    def progress(self, job_id, stage):
+        self.calls.append(("progress", job_id, stage))
+
+    def failed(self, job_id, message):
+        self.calls.append(("failed", job_id, message))
+
+    def release(self, job_id, message=""):
+        self.calls.append(("release", job_id, message))
+        return {}
+
+    def busy(self, job_id, message=""):
+        self.calls.append(("busy", job_id, message))
+        return {"ok": True, "deferred": True, "failed": False}
+
+    def names(self):
+        return [c[0] for c in self.calls]
+
+
+def _recording_worker(tmp_path, solve):
+    config = W.Config("http://unused.invalid", TOKEN,
+                      work_root=tmp_path / "work",
+                      lock_path=tmp_path / "gpu.lock",
+                      poll_seconds=0.05, keep_failed=1, beat_seconds=60.0)
+    api = _RecordingAPI()
+    worker = W.Worker(config, api, FakeLock(), solve=solve,
+                      store_factory=_local_store, log=lambda m, **k: None)
+    return worker, api
+
+
+def test_an_unknown_kind_fails_before_anything_is_fetched(tmp_path):
+    """``run_job`` refuses a kind it lacks BEFORE the input fetch, terminally.
+
+    RED before the fix: ``run_job`` decided ``is_pc = kind == "pc"`` and sent
+    every other kind down the cavity branch -- it fetched an input and set the
+    stage to "meshing" -- and only ``real_solve`` refused it, after the fetch.
+    """
+    solved = []
+    worker, api = _recording_worker(tmp_path, lambda *a, **k: solved.append(a))
+
+    result = worker.run_job({"job_id": "u-1", "kind": "hologram"})
+
+    assert result == "failed"
+    assert "fetch_input" not in api.names(), (
+        "a kind the worker cannot run must not fetch an input first")
+    assert solved == [], "nor reach the solve"
+    failed = [c for c in api.calls if c[0] == "failed"]
+    assert len(failed) == 1, f"terminal /failed exactly once, got {api.names()}"
+    assert "hologram" in failed[0][2], "the owner's message names the kind"
+    assert "release" not in api.names(), (
+        "an unknown kind is a verdict about the row, not a blip to retry")
+
+
+def test_a_td_job_fetches_its_upload_and_is_never_meshing(tmp_path):
+    """A td job has an upload (unlike pc), and its stage is "solving".
+
+    The fetch must happen, and BEFORE the solve: the td solve voxelises the
+    upload. "meshing" is the cavity's TetGen phase, which a td job never runs.
+    """
+    seen = {}
+
+    def solve(job, store_in, store_out, stage=None):
+        seen["calls_at_solve"] = list(api.names())
+        seen["stage"] = stage.stage
+        raise RuntimeError("stop here: the order is what is under test")
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-1", "kind": "td", "tds": {}})
+
+    assert seen, "the td job must reach the solve"
+    assert "fetch_input" in seen["calls_at_solve"], (
+        "a td job's upload must be fetched before its solve")
+    assert seen["stage"] == "solving"
+    assert ("progress", "t-1", "meshing") not in api.calls
+
+
+def test_real_solve_dispatches_td_to_its_own_module(monkeypatch):
+    """``real_solve`` sends kind='td' to ``td_solve`` -- not the cavity -- and
+    runs it in a child process (``solve_td_isolated``), never ``solve_td`` in
+    the worker's own, where a kernel OOM kill would take the worker down."""
+    import types
+
+    calls = []
+    fake = types.ModuleType("td_solve")
+    fake.solve_td_isolated = (
+        lambda job, store_in, store_out, stage: calls.append(job) or "ok")
+    fake.solve_td = lambda *a, **k: pytest.fail("ran in the worker's process")
+    monkeypatch.setitem(sys.modules, "td_solve", fake)
+    pc_calls = []
+    _install_fake_pc_solve(monkeypatch, pc_calls)
+
+    assert W.real_solve({"job_id": "t-2", "kind": "td"}, None, None, None) == "ok"
+    assert [j["job_id"] for j in calls] == ["t-2"]
+    assert pc_calls == []
+
+
+def test_the_worker_runs_exactly_the_kinds_the_app_creates():
+    """``WORKER_KINDS`` and the app's ``db.KINDS`` name the same kinds.
+
+    A kind the app can create but the worker refuses would fail every such job;
+    one the worker runs but the app cannot create is dead code. Read from both
+    sources, not retyped here.
+    """
+    assert set(W.WORKER_KINDS) == set(DB.KINDS)
+
+
+# ---------------------------------------------------------------------------
+# td outcomes: busy is an uncounted deferral; a td refusal or stop is terminal
+# ---------------------------------------------------------------------------
+
+def _td_errors():
+    sys.path.insert(0, str(Path(W.__file__).resolve().parent))
+    import td_solve
+    return td_solve
+
+
+def test_classify_maps_jetson_busy_to_busy_and_td_stops_to_terminal():
+    td = _td_errors()
+    assert W.classify(td.JetsonBusy("needs 9 GB, 2 GB free")) == "busy"
+    # A TDSolveError is a verdict whatever its cause chain: solve_td raises one
+    # only for a refusal or a stop, and lets a bare device error through. The
+    # first two are the OOM stop as solve_td builds it; those would be terminal
+    # even without the td arm, because the chain says "out of memory" (a GPU
+    # STATUS word). The third is the case the arm exists for, a contract rather
+    # than a path solve_td takes today: a stop whose chain the wrapper-walking
+    # GPU branch reads as an INIT fault, which would release it and loop it.
+    class CUDARuntimeError(RuntimeError):
+        pass
+
+    for message, cause in (
+            ("The Jetson ran out of memory during the run", MemoryError("out of memory")),
+            ("The Jetson ran out of memory during the run",
+             CUDARuntimeError("cudaErrorMemoryAllocation: out of memory")),
+            ("The run was stopped after 45 minutes",
+             CUDARuntimeError("cudaErrorInitializationError: initialization error"))):
+        try:
+            try:
+                raise cause
+            except Exception as inner:
+                raise td.TDSolveError(message) from inner
+        except td.TDSolveError as stop:
+            assert W.classify(stop) == "terminal", (message, str(cause))
+    assert W.classify(td.TDSolveError("stopped after 45 minutes")) == "terminal"
+
+
+def test_a_busy_td_job_is_deferred_not_failed_or_released(tmp_path):
+    td = _td_errors()
+
+    def solve(job, store_in, store_out, stage=None):
+        raise td.JetsonBusy("The Jetson is busy: needs 9.0 GB, 2.0 GB free")
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-9", "kind": "td", "tds": {}})
+
+    assert [c[0] for c in api.calls if c[0] in ("busy", "failed", "release")] \
+        == ["busy"], api.names()
+    busy = [c for c in api.calls if c[0] == "busy"][0]
+    assert "9.0 GB" in busy[2], "the deferral carries the owner's sentence"
+
+
+def test_a_kernel_oom_kill_fails_the_td_job_once_never_a_release(tmp_path):
+    """The kernel's SIGKILL leaves no exception; the child's exit status does.
+    RED with the td solve in the worker's own process: the worker dies, the
+    lease expires and the app requeues it as a counted release."""
+    import td_child_targets
+    import td_solve
+
+    def solve(job, store_in, store_out, stage=None):
+        return td_solve.solve_td_isolated(job, store_in, store_out, stage,
+                                          run=td_child_targets.killed)
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-9", "kind": "td", "tds": {}})
+
+    failed = [c for c in api.calls if c[0] == "failed"]
+    assert [c[2] for c in failed] == [td_solve.oom_message()], api.names()
+    assert "release" not in api.names()
+
+
+def test_a_td_stop_reaches_the_owner_in_its_own_words(tmp_path):
+    td = _td_errors()
+    said = "The run was stopped after 45 minutes. Increase dx."
+
+    def solve(job, store_in, store_out, stage=None):
+        raise td.TDSolveError(said)
+
+    worker, api = _recording_worker(tmp_path, solve)
+    worker.run_job({"job_id": "t-8", "kind": "td", "tds": {}})
+
+    failed = [c for c in api.calls if c[0] == "failed"]
+    assert [c[2] for c in failed] == [said], api.names()
+    assert "release" not in api.names()

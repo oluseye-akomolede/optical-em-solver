@@ -1,0 +1,1673 @@
+#!/usr/bin/env python3
+"""Prove the two SQL properties a tier-1 double CANNOT prove.
+
+Run against a THROWAWAY Postgres, never production. The connection comes from
+the ENVIRONMENT, never from argv: a DSN on the command line is visible to every
+seat's ``ps`` on this shared VM, and the habit leaks real passwords even when
+the password in question is a throwaway container's. There is deliberately no
+``--dsn`` flag, so the insecure form is not even expressible:
+
+    export DATABASE_URL="postgresql://postgres:pw@127.0.0.1:55432/msecheck"
+    .venv-mse/bin/python tests/pg_race_check.py
+
+The individual ``PGHOST`` / ``PGPORT`` / ``PGUSER`` / ``PGPASSWORD`` /
+``PGDATABASE`` variables work too -- ``DATABASE_URL`` wins if both are set, which
+is libpq's own precedence. ``PGPASSWORD`` is no better on the process table than
+argv is, but it is at least not in this file's documented command line; for a
+throwaway container either is safe, and for a real one the connection should be
+reached through ``~/.pgpass`` instead.
+
+Run it against a FRESH database, and do not trust a second run on a dirty one.
+This check does not clean up after itself, and three of its legs depend on being
+handed the row they inserted -- while ``claim_jetson`` returns the OLDEST
+claimable row. Against a database left over from an earlier run this check
+reports failures that are not defects. That is a real limitation, and the
+opposite of the rule this file exists to enforce: an instrument that cannot say
+"could not ask" must never say "nothing there". So it now says so loudly --
+``_claim_row`` raises rather than returning None when the row is unreachable --
+and this note is the honest label on the remaining gap. Recreate the container
+between runs:
+
+    docker rm -f mse-pgcheck && docker run -d --rm --name mse-pgcheck \\
+      -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=msecheck -p 55432:5432 \\
+      postgres:16-alpine
+
+-- and TEAR IT DOWN when you are done, ending with ``docker ps -a``:
+
+    docker rm -f mse-pgcheck && docker ps -a
+
+(``DOCKER_CONFIG=~/.docker-mse`` for both, and for every docker command in this
+rig.) The trailing ``docker ps -a`` is not ceremony: a check leaves a container
+behind every time it is run, and a leftover holds the port so the NEXT run
+connects to the old one -- whose schema is the previous commit's. That is a
+check silently reading a stale world, which is the failure this file exists to
+prevent, committed by the file itself.
+
+Why this file exists
+--------------------
+The rest of the suite runs against a Python double (tests set ``MSE_DB_MOCK``),
+and ``LeaseDb``'s docstring says so honestly: *no test there can fail because the
+real ``web/db.py`` query is wrong*. Two things were therefore verified by READING
+and never by RUNNING:
+
+  1. ``claim_jetson``'s SELECT column list and the row indices it returns -- the
+     SELECT lists ``min_feature_m, scale`` and the return reads ``row[4]``,
+     ``row[5]``. Change the SELECT to ``NULL, NULL`` and the whole suite stays
+     green.
+  2. Any bound on repeated releases. A race needs two concurrent transactions in
+     ONE database. A Python double reimplements the logic, so it cannot exhibit
+     the interleaving whether the real UPDATE is atomic or not: a test through
+     the double passes on the fix AND on the broken read-test-write version,
+     i.e. it is a no-op for exactly the property it claims to check.
+
+This script closes both by running the real statements against real Postgres.
+
+It found a THIRD thing while being written, which is now one of its checks:
+`release_jetson` clears `lease_owner` but leaves `status = 'running'`, and
+`claim_jetson` only claims `status = 'queued'`. So a released job is claimable by
+NOBODY -- the docstring's promise ("another worker can pick the job up
+immediately") is false in the code, and `/failed` with it. Measured, not read:
+the B1 leg below drives the real methods and reports the status after each
+release.
+
+Design notes, so the next reader can trust it:
+  * The schema is applied by the PROJECT'S OWN ``JobStore.apply_schema()``, not
+    by a splitter here. An earlier version of this file hand-rolled a ``;``
+    splitter and mis-split the file on semicolons inside comments, silently
+    dropping every ``DO $$`` block -- a checker that could not check. Reuse the
+    real code path; do not restate it.
+  * It DISCOVERS the release-counter column instead of assuming a name, so it
+    keeps working whichever spelling the implementation chose, and reports a
+    clear failure if no counter exists at all.
+  * It calls the REAL ``JobStore`` methods. Re-stating their SQL here would test
+    this file's transcription, not web/db.py -- the failure mode it exists to
+    catch would move into the test.
+  * The B2 race RENDEZVOUSES the two sessions at a barrier. Without one they run
+    one after the other and every form looks safe: measured, the lost-update
+    form records 3 releases against a bound of 3 sequentially, and 5 with the
+    barrier. A check that cannot see the defect is worse than no check, so the
+    barrier form is also run as a control that must FAIL.
+  * Any failure to run exits non-zero with ``COULD-NOT-RUN``: a check that did
+    not execute must never be readable as a check that passed.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import uuid
+from pathlib import Path
+
+# The app's own modules, so apply_schema and the SQL under test are the real
+# ones. tests/ is on the path for mse_db_shim, which loads web/db.py by path.
+_TESTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TESTS))
+sys.path.insert(0, str(_TESTS.parent / "web"))
+# The WORKER's own module, so the Gap-B leg drives the real ``WorkerAPI`` and
+# the real ``LeaseLost`` rather than a transcription of them. Under ``web/``
+# only, ``import mse_worker`` would resolve to nothing -- and a leg that
+# re-implemented the client would be testing its own copy of the contract.
+sys.path.insert(0, str(_TESTS.parent / "worker"))
+
+
+#: The parsed dsn dict, set once in main(). JobStore reads dsn["host"] etc, so
+#: the URL is parsed at the edge (psycopg2's own parser) and the dict is what
+#: the checks hand around -- not a second reading of the URL.
+DSN_OF: list[dict] = [{}]
+
+
+class Result:
+    def __init__(self):
+        self.ok = True
+
+    def check(self, name, passed, detail=""):
+        print(f"[{'PASS' if passed else 'FAIL'}] {name}"
+              + (f" -- {detail}" if detail else ""))
+        if not passed:
+            self.ok = False
+        return passed
+
+
+def counter_column(conn) -> str | None:
+    """Whatever the implementation called the release counter, or None.
+
+    Discovered rather than assumed: the name is the implementation's choice and
+    hard-coding one would make this check fail for a spelling difference instead
+    of for a defect.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'mse' AND table_name = 'jobs' "
+            "AND (column_name LIKE '%%release%%' OR column_name LIKE '%%attempt%%' "
+            "     OR column_name LIKE '%%retry%%' OR column_name LIKE '%%fail%%') "
+            "ORDER BY char_length(column_name), column_name"
+        )
+        rows = [r[0] for r in cur.fetchall()]
+    return rows[0] if rows else None
+
+
+def insert_job(conn, job_id, **cols):
+    keys = ["job_id", "units", "n_index", "n_modes", "target", "status"] + list(cols)
+    vals = [job_id, "mm", 1.0, 20, "jetson", "queued"] + list(cols.values())
+    with conn.cursor() as cur:
+        cur.execute(f"INSERT INTO mse.jobs ({', '.join(keys)}) "
+                    f"VALUES ({', '.join(['%s'] * len(vals))})", vals)
+    conn.commit()
+
+
+def check_claim_columns(conn, r: Result, JobStore):
+    """A2: claim_jetson's SELECT and its return indices must agree.
+
+    Insert DISTINCT values for min_feature_m and scale. Identical values would
+    pass a query that selected the right columns in the wrong order, or a return
+    that read the wrong indices -- the check would then be blind to exactly the
+    defect it exists for.
+    """
+    jid = str(uuid.uuid4())
+    insert_job(conn, jid, **{"min_feature_m": 0.37, "scale": 1234.5})
+    # Call the REAL method, so a wrong column list or a wrong row index in
+    # web/db.py fails here. Re-stating its SQL would test my transcription.
+    got = JobStore(dsn=DSN_OF[0]).claim_jetson("w-race", lease_seconds=300)
+    if got is None:
+        return r.check("A2 claim_jetson returns the seeded row", False,
+                       "no row came back")
+    r.check("A2 claim_jetson returns min_feature_m/scale under the right keys "
+            "(a wrong SELECT column or index fails here)",
+            got.get("min_feature_m") == 0.37 and got.get("scale") == 1234.5,
+            f"min_feature_m={got.get('min_feature_m')!r} "
+            f"scale={got.get('scale')!r} (want 0.37 / 1234.5; distinct so a swap "
+            f"or a NULL-pair SELECT is visible)")
+
+
+def check_feature_triplet_roundtrip(conn, r: Result, JobStore):
+    """A2b: the three feature columns survive a write/read cycle, distinctly.
+
+    The row keeps the feature THREE ways -- the number typed, the unit chosen,
+    and the canonical metres -- and all three share one SELECT list and one set
+    of row indices in ``web/db.py``. A swap between ``min_feature_value`` and
+    ``min_feature_m`` (two floats, adjacent in the list) is invisible unless the
+    values are distinct, and it is the exact defect this file exists for: the
+    store would hand back a number that looks right and means something else.
+
+    Read through the REAL ``get_job``, not through re-stated SQL, so a wrong
+    column list or row index in the store fails here rather than in production.
+
+    The inserted row is DELETED before returning. This leg only reads, so it
+    never claims the row, which would leave it ``queued`` and claimable -- and
+    the next leg to claim would be handed THIS row instead of its own, failing
+    with an ordering error that has nothing to do with what it tests. Measured:
+    without this delete, ``check_release_bound``'s ``_claim_row`` drained its
+    ``DRAIN`` allowance on this row and raised. A read-only leg must not leave
+    claimable state behind, for the same reason ``_claim_row`` releases what it
+    touches.
+    """
+    jid = str(uuid.uuid4())
+    # Distinct in EVERY position, including the unit: 0.2 / 2e-4 / 'nm' cannot
+    # be mistaken for one another, whereas 2.0 / 2.0 would hide a swap.
+    insert_job(conn, jid, **{"min_feature_m": 2e-4, "min_feature_value": 0.2,
+                             "min_feature_unit": "nm"})
+    try:
+        got = JobStore(dsn=DSN_OF[0]).get_job(jid)
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM mse.jobs WHERE job_id = %s", (jid,))
+        conn.commit()
+    if got is None:
+        return r.check("A2b get_job returns the seeded row", False, "no row")
+    r.check("A2b the min_feature_* triplet round-trips through the real store "
+            "(a value<->metres swap or an off-by-one index fails here)",
+            got.get("min_feature_m") == 2e-4
+            and got.get("min_feature_value") == 0.2
+            and got.get("min_feature_unit") == "nm",
+            f"m={got.get('min_feature_m')!r} value={got.get('min_feature_value')!r} "
+            f"unit={got.get('min_feature_unit')!r} (want 2e-04 / 0.2 / 'nm')")
+
+
+#: The image tag production runs, and therefore the schema the next upgrade
+#: starts from. Named here so the leg says which deployment it is testing; a
+#: stale value would make the leg check an upgrade nobody will perform.
+DEPLOYED_TAG = "8e27869"
+
+
+def _deployed_schema_sql() -> str | None:
+    """``db/001_schema.sql`` as it was at the deployed tag, or None.
+
+    Read out of git rather than retyped: the point of the leg is that the
+    upgrade starts from the real deployed shape, and a transcription of it here
+    would be a second copy that can drift from the file that actually shipped.
+    None (rather than a raise) when git cannot answer, so the leg can report
+    "could not ask" instead of passing on an untested upgrade.
+    """
+    import subprocess  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{DEPLOYED_TAG}:db/001_schema.sql"],
+            cwd=root, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 and result.stdout else None
+
+
+def _job_columns(cur) -> list[str]:
+    """The column names of ``mse.jobs``, ordered, as the DB currently has them."""
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'mse' AND table_name = 'jobs'
+        ORDER BY column_name
+    """)
+    return [row[0] for row in cur.fetchall()]
+
+
+def check_upgrade_matches_a_fresh_schema(conn, r: Result, JobStore, db_module):
+    """A2c: upgrading the DEPLOYED schema gives the same columns as a fresh one.
+
+    The upgrade that has to work is the one production will actually run, and
+    production is at image tag 8e27869 -- a schema with no ``min_feature*``
+    column and no ``scale`` column. (An earlier version of this leg recreated an
+    intermediate commit's shape instead, which proved a property production
+    never exercises and motivated a DROP that would never have fired there. The
+    leg now models the real starting point.)
+
+    What this proves: the additive path from 8e27869 lands on exactly the fresh
+    shape, so the same code reads the same columns on a new deploy and an
+    upgraded one. A double cannot check it -- the property is about two REAL
+    schema shapes -- and it is worth checking because a column present in one
+    shape and absent in the other works on one machine and fails on the next.
+
+    Run inside a transaction that is ROLLED BACK, so the legs after this one see
+    the schema they expect.
+    """
+    # The 8e27869 DDL is not retyped here or approximated by dropping columns:
+    # the checkout carries it, and applying the real file is the only way to be
+    # sure the "before" shape is what production actually runs. Only four
+    # columns were dropped by the hand-reduction this replaced, which would have
+    # missed k8s_job_name/target/gpu_queued_at and quietly made the leg easier
+    # than the upgrade it claims to test.
+    deployed_ddl = _deployed_schema_sql()
+    if deployed_ddl is None:
+        return r.check("A2c the deployed (8e27869) schema is available to test "
+                       "the upgrade from", False,
+                       "git could not read db/001_schema.sql at 8e27869 -- the "
+                       "leg cannot reproduce the real starting shape")
+    with open(db_module._schema_path(), encoding="utf-8") as handle:
+        current_ddl = handle.read()
+
+    with conn.cursor() as cur:
+        # The FRESH shape, captured before anything is torn down: this is what
+        # ``apply_schema`` produces on an empty database, and it is the target
+        # the upgrade must land on.
+        fresh = _job_columns(cur)
+    if not fresh:
+        return r.check("A2c the current schema produces mse.jobs", False, "[]")
+
+    with conn.cursor() as cur:
+        # Everything happens inside one transaction that is ROLLED BACK: the
+        # legs after this one must see the schema they expect, and this leg
+        # rebuilds tables.
+        cur.execute("BEGIN")
+        # The "before" state is production's, produced by applying the DEPLOYED
+        # file rather than by dropping a few columns off the current one. The
+        # hand-reduction this replaced would have missed k8s_job_name, target and
+        # gpu_queued_at, making the leg quietly easier than the upgrade it claims
+        # to test.
+        cur.execute("DROP TABLE IF EXISTS mse.modes")
+        cur.execute("DROP TABLE IF EXISTS mse.jobs")
+        cur.execute(deployed_ddl)
+        before = _job_columns(cur)
+        # ...then the CURRENT file, exactly as the deployed initContainer runs it.
+        cur.execute(current_ddl)
+        after = _job_columns(cur)
+        cur.execute("ROLLBACK")
+
+    if not before:
+        return r.check("A2c applying the deployed schema produces mse.jobs",
+                       False, "8e27869's DDL created no columns -- bad starting "
+                              "state, the upgrade was not tested")
+
+    # The STARTING shape is asserted on its own, not just used. `after == fresh`
+    # would also hold if this leg accidentally applied the CURRENT schema twice
+    # -- a copy/paste of the wrong DDL, or _deployed_schema_sql() silently
+    # returning the working-tree file -- and it would then pass while testing no
+    # upgrade at all. This is the same could-not-ask shape the rig keeps hitting:
+    # an equality between two things is not evidence about either one.
+    #
+    # 12 is production's count at 8e27869 (measured, not assumed); the four
+    # exclusions are the columns the upgrade is supposed to ADD, so their absence
+    # before is what makes their presence after meaningful.
+    EXPECTED_BEFORE = 12
+    ADDED_BY_THE_UPGRADE = ("min_feature_m", "min_feature_value",
+                            "min_feature_unit", "scale")
+    leaked = [c for c in ADDED_BY_THE_UPGRADE if c in before]
+    starting_shape_ok = (len(before) == EXPECTED_BEFORE and not leaked)
+    r.check("A2c the STARTING shape is really 8e27869's (12 columns, none of "
+            "the upgrade's columns yet)",
+            starting_shape_ok,
+            f"got {len(before)} columns (expected {EXPECTED_BEFORE}); columns "
+            f"the upgrade should be adding but which are already present: "
+            f"{leaked} -- the 'after' comparison below would pass vacuously")
+    if not starting_shape_ok:
+        # The equality cannot be read as evidence if the "before" state was not
+        # the deployed one. Report it as not-run rather than as a pass.
+        return r.check("A2c upgrading the DEPLOYED (8e27869) schema lands on "
+                       "exactly the fresh set of columns", False,
+                       "not evaluated: the starting shape was wrong, so the "
+                       "comparison proves nothing")
+
+    r.check("A2c upgrading the DEPLOYED (8e27869) schema lands on exactly the "
+            "fresh set of columns",
+            after == fresh,
+            f"upgrade-only={sorted(set(after) - set(fresh))} "
+            f"missing-after-upgrade={sorted(set(fresh) - set(after))} "
+            f"(before the upgrade: {len(before)} columns, after: {len(after)})")
+
+
+def _race(conn, dsn, r: Result, col: str, bound: int, rounds: int = 60,
+          predicate: bool = True):
+    """Two sessions, each reading `col`, meeting at a barrier, then writing.
+
+    The barrier is the whole point. Run the two sessions one after the other and
+    every form looks safe, because the second one always sees the first one's
+    committed row -- so the check would pass for a reason that has nothing to do
+    with the property, which is the defect this file exists to avoid. Measured on
+    this container: WITH the barrier the no-predicate form records 5 releases
+    against a bound of 3; WITHOUT it, 3. Returns the worst count seen.
+    """
+    import threading  # noqa: PLC0415
+    import psycopg2  # noqa: PLC0415
+
+    worst = 0
+    for _ in range(rounds):
+        jid = str(uuid.uuid4())
+        insert_job(conn, jid, **{"lease_owner": "w-race"})
+        # This row exists only to carry the counter through the race, and it is
+        # retired the moment the round's count is read. Round N leaves round
+        # N-1 behind as ``status='queued' AND lease_owner IS NULL`` -- exactly
+        # the shape a later leg's claim takes -- and there are 100 of them
+        # (40 control rounds + 60), more than any drain allowance. Measured:
+        # without this, check_release_is_terminal's ``_claim_row`` was handed
+        # these rows instead of its own and raised.
+        #
+        # ``status='failed'`` is what makes it terminal: it satisfies
+        # ``claim_jetson``'s ``lease_owner IS NULL`` gate while failing its
+        # ``status = 'queued'`` gate, so the row is invisible to every later
+        # claim while still holding the column shape this check needs to read
+        # back. The counter itself is left alone -- this check's subject.
+        #
+        # (The gate is ``status AND lease_owner`` TOGETHER. A future reader who
+        # "simplifies" this to just clearing the lease reintroduces 100
+        # claimable rows; that is why the status is set, not the owner nulled.)
+        a = psycopg2.connect(**dsn)
+        b = psycopg2.connect(**dsn)
+        a.autocommit = b.autocommit = True
+        bar = threading.Barrier(2)
+
+        def seat(s, predicate):
+            for _ in range(bound + 2):
+                with s.cursor() as cur:
+                    cur.execute(f"SELECT {col} FROM mse.jobs WHERE job_id = %s",
+                                (jid,))
+                    n = cur.fetchone()[0]
+                try:
+                    bar.wait(timeout=5)
+                except threading.BrokenBarrierError:
+                    pass
+                with s.cursor() as cur:
+                    if predicate:
+                        cur.execute(
+                            f"UPDATE mse.jobs SET {col} = {col} + 1 "
+                            f"WHERE job_id = %s AND {col} < %s", (jid, bound))
+                    else:
+                        cur.execute(f"UPDATE mse.jobs SET {col} = %s "
+                                    f"WHERE job_id = %s", (n + 1, jid))
+
+        ts = [threading.Thread(target=seat, args=(s, predicate))
+              for s in (a, b)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {col} FROM mse.jobs WHERE job_id = %s", (jid,))
+            worst = max(worst, cur.fetchone()[0])
+            cur.execute("UPDATE mse.jobs SET status = 'failed' WHERE job_id = %s",
+                        (jid,))
+        conn.commit()
+        a.close()
+        b.close()
+    return worst
+
+
+def check_release_bound(conn, r: Result, bound: int, dsn: dict, JobStore,
+                        db_module):
+    """B2: the bound must be enforced INSIDE the UPDATE, not by the caller.
+
+    Two sessions race to release one row; the counter must never pass `bound`.
+
+    What this can and cannot show, stated rather than implied. At READ COMMITTED
+    -- the app's level, web/db.py sets autocommit and never an isolation level --
+    an UPDATE carrying `WHERE c < bound` is atomic by itself: the row lock
+    serialises the two sessions and Postgres re-evaluates the predicate after
+    waiting. So this check does not discriminate "one statement" from "two
+    statements"; both pass, and either implementation is genuinely safe. What it
+    DOES discriminate is a release that tests the counter OUTSIDE the UPDATE --
+    read c, then `SET c = k` unconditionally. That form loses updates and records
+    bound+2 or more. The control below runs exactly that and must FAIL, so a PASS
+    on the real code means the predicate is in the statement, not merely that the
+    race was never run.
+    """
+    import psycopg2  # noqa: PLC0415
+
+    col = counter_column(conn)
+    if col is None:
+        return r.check("B2 a release counter column exists", False,
+                       "no release/attempt/retry counter in mse.jobs -- the bound "
+                       "cannot exist without one")
+    print(f"      (counter column discovered: mse.jobs.{col})")
+
+    # Control first, while the schema is untouched by this check: the shape that
+    # MUST break. If it does not break, this check cannot see the defect and a
+    # later PASS would be hollow.
+    broken = _race(conn, dsn, r, col, bound, rounds=40, predicate=False)
+    r.check("B2 control: a lost-update release DOES break the bound "
+            "(so the check can see the defect)",
+            broken > bound,
+            f"that form recorded {broken} releases against bound {bound}")
+
+    good = _race(conn, dsn, r, col, bound)
+    r.check(f"B2 counter never exceeds the bound ({bound}) under concurrent "
+            f"releases", good <= bound, f"worst {col}={good} over 60 rounds")
+
+    check_release_is_terminal(conn, r, bound, JobStore)
+    check_release_not_in_the_gate(r, db_module)
+    check_release_refuses_a_non_holder(conn, r, JobStore)
+
+
+def check_release_is_terminal(conn, r: Result, bound: int, JobStore):
+    """B1/B2 on the REAL release path: releasing `bound` times must end FAILED.
+
+    Calls web/db.py, not a copy of its SQL.
+
+    What a "release" IS, pinned explicitly, because the earlier form of this leg
+    counted calls instead of looking and so could not tell the two apart. A
+    release that matters is one web/db.py records -- ``release_count`` moves and
+    the job goes back to ``queued``. The release that discovers the bound
+    already reached records nothing and is the terminal one. Counting CALLS
+    makes a correct implementation report bound+1 (the extra call is the one
+    that ends it) and go red against its own bound.
+
+    Read the counter from the row rather than assuming a call moved it. The
+    other reason the call count is wrong here: ``claim_jetson`` takes the OLDEST
+    claimable row, so this loop's claim can return a FOREIGN row, and
+    ``lease_held_by(jid)`` then breaks out while a release against the job it
+    actually claimed has landed on that other job's counter.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    if not hasattr(store, "release_jetson"):
+        return r.check("B1 release_jetson exists", False, "method missing")
+    jid = str(uuid.uuid4())
+    insert_job(conn, jid)                     # queued, unclaimed, no lease yet
+    status_after, message = None, ""
+    releases = 0
+    # Claim ONCE, before the loop, and use that lease in the first iteration.
+    # The claim is a state CHANGE, not a question: it takes the lease and moves
+    # the row to ``running``, so a second claim for the same row correctly finds
+    # nothing claimable and returns None. An earlier form claimed here "to check
+    # the row is reachable" and then claimed again inside the loop, which read
+    # its own first claim as "the job has terminated" and reported a crash loop
+    # that had not run. Probing a row by claiming it consumes the thing the
+    # probe was meant to establish; check it with a SELECT instead.
+    claimed = _claim_row(store, jid, owner="w-race")   # ITS OWN row, not oldest
+    for _ in range(bound + 5):
+        if claimed is None:
+            break                             # not claimable: it terminated
+        with conn.cursor() as cur:
+            cur.execute("SELECT release_count FROM mse.jobs WHERE job_id = %s",
+                        (jid,))
+            before = cur.fetchone()[0]
+        # The lease came from the real claim path, the way the worker tick does,
+        # so lease_expires_at is a real timestamp -- a hand-seeded lease_owner
+        # has no expiry and lease_held_by (which requires lease_expires_at >
+        # now()) reads it as not held.
+        released = store.release_jetson(jid, "w-race")   # what /release does
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, COALESCE(message,''), release_count "
+                        "FROM mse.jobs WHERE job_id = %s", (jid,))
+            got = cur.fetchone()
+        if got is None:
+            raise AssertionError(
+                f"row {jid} vanished: claim returned {claimed['job_id']}, "
+                f"release_jetson returned {released!r}, and the next SELECT "
+                f"found no row. Something DELETED it -- this leg only reads "
+                f"and updates, so the instrument is wrong about the table."
+            )
+        status_after, message, after = got
+        if after > before:
+            releases += 1                     # a release this store RECORDED
+        else:
+            break                             # the terminal call: recorded none
+        # The next round needs a fresh lease, and by now the row is back to
+        # ``queued`` with no owner -- so this claim is the one that either hands
+        # it back or reports that the bound has taken it out of the pool.
+        claimed = _claim_row(store, jid, owner="w-race")
+    r.check(f"B1 a deterministic failure reaches FAILED at {bound} recorded "
+            f"releases (counter stopped at {releases})",
+            status_after == "failed" and releases == bound,
+            f"status={status_after!r} after {releases} recorded releases "
+            f"(message {message!r})")
+
+
+def check_release_not_in_the_gate(r: Result, db_module):
+    """The hollow-PASS trap, as a test rather than a note.
+
+    If `releases_are_terminal` were written as `if releases <= bound` while
+    releases is still 0 (the counter read before it is incremented, the classic
+    off-by-one), it would return True immediately and the bound would be
+    decorative. The test is a tripwire: it must make the guard say False, so a
+    guard that cannot say False anywhere fails here.
+
+    The decided contract puts it at MODULE level. Either location is accepted --
+    the check is that the bound can be stated and interrogated as a predicate at
+    all, and where the implementation chose to hang it is not this check's
+    business.
+    """
+    gate = getattr(db_module, "releases_are_terminal", None)
+    where = "module"
+    if gate is None:
+        gate = getattr(db_module.JobStore, "releases_are_terminal", None)
+        where = "JobStore"
+    if gate is None:
+        return r.check("B1 the bound is expressed as a testable predicate",
+                       False,
+                       "no releases_are_terminal(...) on the module or on "
+                       "JobStore -- the bound cannot be checked except by "
+                       "running the whole loop, so a hollow guard could pass "
+                       "unnoticed")
+    ok = bool(gate(0, 3)) is False and bool(gate(2, 3)) is False \
+        and bool(gate(3, 3)) is True
+    r.check("B1 releases_are_terminal refuses 0 and 2, allows 3 "
+            "(a guard that only ever returns True fails here)", ok,
+            f"checked (0,3)->False, (2,3)->False, (3,3)->True on {where}")
+
+
+def check_release_refuses_a_non_holder(conn, r: Result, JobStore):
+    """E: a release by a worker that does not hold the lease must be refused."""
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    insert_job(conn, jid, **{"lease_owner": "w-holder"})
+    got = store.release_jetson(jid, "w-someone-else")
+    with conn.cursor() as cur:
+        cur.execute("SELECT lease_owner FROM mse.jobs WHERE job_id = %s", (jid,))
+        owner = cur.fetchone()[0]
+    # ``None`` is the decided refusal value for "this worker does not hold the
+    # lease" -- the same value the route turns into a 409, and a different event
+    # from "released" or "failed". ``False`` is accepted too: both mean refused,
+    # and pinning one spelling would fail a correct implementation that picked
+    # the other.
+    r.check("E releasing a lease you do not hold is refused and changes nothing",
+            (got is None or got is False) and owner == "w-holder",
+            f"release_jetson returned {got!r} (want None or False), "
+            f"lease_owner now {owner!r}")
+
+
+# ---------------------------------------------------------------------------
+# C. the EXPIRY path -- a separate route, so it gets its own legs
+#
+# A worker that dies mid-job never calls /release: it dies, and the row comes
+# back through lease EXPIRY (reclaim_expired_leases, run by the app's tick).
+# That is a DIFFERENT code path from release_jetson, and the reviewer's point is
+# that it must be checked on its own rather than reused with a different caller
+# -- the two can diverge, and the expiry one is exactly where the stranding bug
+# lived. Each leg below is red when the status reset or the bound is removed
+# from reclaim_expired_leases; neither leg exercises release_jetson.
+# ---------------------------------------------------------------------------
+
+def _expire_lease(conn, job_id):
+    """Make ``job_id``'s lease already expired, as a dead worker leaves it.
+
+    Set the deadline in the past rather than nulling the lease: the reclaim
+    query selects on ``lease_expires_at < now()``, so a NULL expiry is not an
+    expired lease -- it is a row with no lease at all, which is a different
+    state and would make this leg check nothing.
+    """
+    with conn.cursor() as cur:
+        cur.execute("UPDATE mse.jobs SET lease_expires_at = now() - "
+                    "interval '1 hour' WHERE job_id = %s", (job_id,))
+    conn.commit()
+
+
+def check_expiry_requeues_the_job(conn, r: Result, JobStore):
+    """C1: an expired lease must make the job CLAIMABLE AGAIN by ANOTHER worker.
+
+    The stranding bug, exactly: ``claim_jetson`` requires ``status = 'queued'
+    AND lease_owner IS NULL``, so a reclaim that clears the lease but leaves the
+    row ``running`` produces a job no worker can take. Nothing errors and
+    nothing loops -- the job just never moves again.
+
+    Driven through the real methods end to end: a real claim (so the lease has a
+    real deadline), the lease expires, the real reclaim, then ANOTHER worker
+    claims through the real gate. The assertion that matters is the last step:
+    it is the only one that can observe the stranding.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    insert_job(conn, jid)
+
+    # claim_jetson takes the OLDEST claimable row, and earlier legs leave rows
+    # of their own behind. Claim until THIS leg's row comes back, so the leg
+    # tests the stranding bug rather than the order the table happened to be in.
+    claimed = _claim_row(store, jid)
+    if claimed is None:
+        return r.check("C1 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    _expire_lease(conn, jid)
+    reclaimed = store.reclaim_expired_leases()
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, lease_owner FROM mse.jobs WHERE job_id = %s",
+                    (jid,))
+        status, owner = cur.fetchone()
+
+    # THE assertion: a different worker, through the real gate.
+    again = _claim_row(store, jid)
+    r.check("C1 an expired lease leaves the job claimable by ANOTHER worker "
+            "(a reclaim that does not reset status strands it here)",
+            again is not None and again["job_id"] == jid,
+            f"after reclaim status={status!r} lease_owner={owner!r}, "
+            f"reclaim returned {reclaimed!r}, re-claim got {again!r} -- "
+            f"claim_jetson needs status='queued' AND lease_owner IS NULL")
+
+
+#: how many foreign rows a leg may walk past. Kept BELOW the default bound (3)
+#: on purpose: each skip releases the row, and a skip count at or over the
+#: bound could fail a foreign job that this check would then wrongly own.
+DRAIN = 2
+
+
+def _claim_row(store, jid, owner="w-leg", lease_seconds=300):
+    """Claim until ``jid`` comes back, or give up. Returns the job dict or None.
+
+    ``claim_jetson`` returns the OLDEST claimable row, so a leg that inserts a
+    job and then claims may be handed an earlier leg's row. Today no earlier leg
+    leaves a claimable one (each inserted row is either claimed, so ``running``,
+    or carries an owner, so the gate refuses it), and this walks past that
+    assumption instead of resting on it -- a future leg that inserts without
+    claiming would otherwise turn C1's assertion into an ordering test.
+
+    A foreign row is handed back with ``release_jetson`` before moving on. That
+    is load-bearing: a plain claim leaves the row ``running`` under an owner
+    that will never touch it, which is precisely the stranded state these legs
+    exist to detect -- the instrument must not manufacture the defect it looks
+    for. The release is bounded by the same counter as everything else, so
+    ``DRAIN`` is kept well under ``bound``.
+
+    ``None`` means ONE thing here. An earlier version returned it both for "no
+    claimable row at all" and for "claimed ``DRAIN`` foreign rows and never
+    reached yours", and the second case is silent data loss for the caller: the
+    B1 leg read ``None`` as "the job has terminated" and stopped, reporting a
+    crash loop that had not run. Whenever two different conditions collapse onto
+    one return value, the callers eventually believe the wrong one.
+    """
+    for _ in range(DRAIN):
+        job = store.claim_jetson(owner, lease_seconds=lease_seconds)
+        if job is None:
+            return None
+        if job["job_id"] == jid:
+            return job
+        # Hand the foreign row BACK, which is the only correct move: the row is
+        # ``running`` under an owner this leg is not, and marking it failed here
+        # would MANUFACTURE the stranded-row defect these legs exist to detect
+        # (and would strand a real worker still solving it). ``mark_failed`` was
+        # tried and is wrong for exactly that reason.
+        #
+        # The loop still terminates because ``claim_jetson`` gates on
+        # ``status='queued' AND lease_owner IS NULL`` TOGETHER: a released row
+        # returns to ``queued`` with the lease nulled, so it IS handed back once
+        # -- but ``_race`` retires its own rows terminal, so nothing accumulates
+        # more than one or two of these and DRAIN=2 is enough. The measurement
+        # that matters is in ``_race``'s docstring: 100 rows were left claimable
+        # before that retirement, and the drain raised on every leg after it.
+        store.release_jetson(job["job_id"], owner, "not the row under test")
+    raise AssertionError(
+        f"{jid} was still claimable when the leg started but not among the "
+        f"first {DRAIN} rows claim_jetson handed back; the store is not empty "
+        f"and this leg cannot see the row it is about. Run this check against a "
+        f"clean database (it does not clean up between runs)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# D. the APP-SIDE terminal path, and the reaper's Jetson blind spot
+#
+# These two legs are the integration the second dispatch deploy was missing.
+# Everything above exercises the WORKER's routes (/release, /failed, expiry).
+# Neither of the bugs below lives there: one is the app failing a row on its own
+# initiative, and the other is the tick mis-reading a lease-owned row as dead.
+# Both were invisible to every unit test because those drive a DOUBLE that
+# models the contract, not the real SQL.
+# ---------------------------------------------------------------------------
+
+def _insert_jetson_job(conn, job_id):
+    """A row queued for the GPU, as the routing decision leaves it."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO mse.jobs (job_id, original_filename, units, n_index, "
+            "n_modes, status, stage, target) "
+            "VALUES (%s, 'box.obj', 'mm', 1.0, 20, 'queued', 'queued', 'jetson')",
+            (job_id,))
+    conn.commit()
+
+
+def check_mark_failed_clears_the_lease(conn, r: Result, JobStore):
+    """D1: the app failing a CLAIMED row must clear its lease.
+
+    The bug: ``mark_failed`` set the terminal status and left ``lease_owner``
+    set. A Jetson worker renews its lease on every ``/progress``, and the
+    heartbeat treats a 409 as "the lease is gone, stop solving" -- so while the
+    lease survived the failure, the worker had no way to learn the job was over.
+    On the second dispatch deploy it kept solving a failed job of 487,953
+    elements for minutes and only found out when its upload was refused.
+
+    The assertion is the WORKER's observation, not the column: a claim, then a
+    mark_failed, then the real ``renew_lease`` -- which must now return False,
+    because False is what becomes the 409 that stops it.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+
+    claimed = _claim_row(store, jid, owner="w-d1")
+    if claimed is None:
+        return r.check("D1 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    store.mark_failed(jid, "the app failed this job while a worker held it")
+
+    renewed = store.renew_lease(jid, "w-d1", lease_seconds=300)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, lease_owner FROM mse.jobs WHERE job_id = %s",
+                    (jid,))
+        status, owner = cur.fetchone()
+
+    r.check("D1 the app failing a claimed row clears the lease, so the worker's "
+            "next heartbeat 409s and it stops solving (a lease left set means it "
+            "keeps solving a dead job)",
+            renewed is False,
+            f"after mark_failed status={status!r} lease_owner={owner!r} but "
+            f"renew_lease returned {renewed!r} -- want False (the 409)")
+
+
+def check_a_claimed_jetson_job_is_not_reaped_by_the_tick(conn, r: Result,
+                                                         JobStore, app_module):
+    """D2: the tick's dead-job reaper must not fail a claimed JETSON row.
+
+    THE DISPATCH ROLLBACK. ``_fail_dead_jobs`` asks the cluster which Jobs are
+    present; a Jetson job is never there, because the GPU worker is a systemd
+    unit the owner runs rather than a Job this app launches. So "absent" -- the
+    reaper's word for dead -- was every Jetson row's permanent state, and every
+    GPU job died at the first tick after its claim:
+
+        [mse-web] job bdaa3fbd... failed: its Job <unnamed> is gone
+
+    Driven on the REAL store and the REAL ``_fail_dead_jobs``, with a launcher
+    that reports an EMPTY cluster: not a fault, just what a Jetson-only fleet
+    looks like. A Jetson row's liveness is its lease, which is D1's subject.
+
+    This is the leg the row asks for by name, and it is red when the
+    ``target == 'jetson'`` skip is removed from the reaper.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+
+    claimed = _claim_row(store, jid, owner="w-d2")
+    if claimed is None:
+        return r.check("D2 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    class EmptyCluster:
+        """A launcher that can see the cluster and finds no Jobs on it.
+
+        Deliberately NOT ``cannot_ask``: an unreadable cluster is already
+        covered, and it returns 0 for a different reason ("we do not know").
+        This models the true Jetson state -- a successful look that finds
+        nothing, which is the input that failed every GPU job.
+        """
+        dry_run = False
+
+        def active_job_names(self):
+            return []
+
+        def job_states(self):
+            return {}
+
+    before = store.renew_lease(jid, "w-d2", lease_seconds=300)
+    if not before:
+        return r.check("D2 the pre-tick heartbeat works", False,
+                       "renew_lease refused before the tick even ran")
+
+    app_module._fail_dead_jobs(EmptyCluster(), store, log=lambda *a: None)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, lease_owner FROM mse.jobs WHERE job_id = %s",
+                    (jid,))
+        status, owner = cur.fetchone()
+    after = store.renew_lease(jid, "w-d2", lease_seconds=300)
+
+    r.check("D2 a claimed Jetson job SURVIVES a tick that sees an empty cluster "
+            "(the reaper must only judge cluster jobs; a Jetson row's liveness is "
+            "its lease)",
+            status == "running" and owner == "w-d2" and after is True,
+            f"after the tick status={status!r} lease_owner={owner!r}, heartbeat "
+            f"renews={after!r} -- want running/claimed/True. This is the "
+            f"dispatch rollback: 'its Job <unnamed> is gone'")
+
+
+def check_expiry_bound_is_terminal(conn, r: Result, JobStore, bound: int):
+    """C2: repeated expiries must reach FAILED at the bound, not cycle.
+
+    The crash-loop case: a worker that dies every time never calls /release, so
+    if the expiry path did not count against the same bound, such a worker would
+    requeue forever through lease timeouts. This leg uses ONLY the expiry route
+    -- claim, expire, reclaim, repeat -- and asserts it terminates.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    insert_job(conn, jid)
+
+    # Count REQUEUES -- rounds where the reclaim handed the job back -- not
+    # rounds where a claim was merely attempted. The claim that finds the job
+    # already FAILED is the terminal observation, not another expiry, and
+    # counting it made the intact case report bound+1 and go red against its
+    # own bound. ``bound`` requeues are allowed; the (bound+1)th expiry is the
+    # one that fails the job, so ``bound`` is the expected count.
+    requeues = 0
+    for _ in range(bound + 4):
+        # Its OWN row, not whatever claim_jetson hands back first: expiring a
+        # foreign row's lease and then asserting on ``jid`` would report a
+        # crash loop that never happened.
+        if _claim_row(store, jid, owner="w-crashy") is None:
+            break                      # no longer claimable: it terminated
+        _expire_lease(conn, jid)
+        requeued = store.reclaim_expired_leases()
+        if jid not in requeued:
+            break                      # this expiry was the terminal one
+        requeues += 1
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, COALESCE(message, '') FROM mse.jobs "
+                    "WHERE job_id = %s", (jid,))
+        status, message = cur.fetchone()
+
+    r.check(f"C2 a crash-looping worker reaches FAILED at the bound "
+            f"({requeues} requeues, bound {bound})",
+            status == "failed" and requeues == bound,
+            f"status={status!r} after {requeues} requeues (message {message!r})")
+
+
+def check_terminal_rows_are_never_reclaimed(conn, r: Result, JobStore):
+    """D3: a TERMINAL row with an expired lease must not be resurrected.
+
+    Found LIVE at 20:15Z on the 3rd deploy (job 375964fe). The web log read
+    "its GPU worker's lease expired; the job is claimable again", and then a
+    worker claimed it. That row was ``status='failed'``: the reaper failed it
+    during deploy attempt 2, while the OLD ``mark_failed`` left the lease set.
+    ``reclaim_expired_leases`` selected on the expired lease ALONE, so it
+    requeued a job the owner had already been told was over -- and the worker
+    went on to solve it.
+
+    Both terminal states are exercised. A FAILED row is the one seen in
+    production; a DONE row is the same hole by a different door (a job that
+    finished and then got requeued would be solved a second time), and the
+    filter is one predicate covering both, so the leg that only tested FAILED
+    could not tell ``status = 'failed'`` from ``status <> 'running'``.
+
+    The assertion is on the OWNER's row, not on the return value alone: the
+    return is what the caller acts on, but the damage is the row moving. Both
+    are read, because ``reclaim`` reporting ``[]`` while the row moved is
+    exactly the could-not-ask shape this file's own docstring calls out.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    for status in ("failed", "done"):
+        jid = str(uuid.uuid4())
+        _insert_jetson_job(conn, jid)
+        if _claim_row(store, jid, owner=f"w-d3-{status}") is None:
+            return r.check(f"D3 the seeding claim works ({status})", False,
+                           f"claim_jetson never returned {jid}")
+
+        # The legacy shape: terminal, but STILL CARRYING the worker's lease with
+        # its deadline in the past -- exactly the row the third deploy left
+        # behind. The owner is deliberately NOT nulled here: the stale lease is
+        # the bait, and a leg that cleared it first would be testing a row the
+        # fix is not needed for. Written with raw SQL because the code under
+        # test no longer produces this state -- that is the whole point.
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, finished_at = now() "
+                "WHERE job_id = %s",
+                (status, status, jid))
+            cur.execute("SELECT message FROM mse.jobs WHERE job_id = %s", (jid,))
+            message_before = cur.fetchone()[0]
+        conn.commit()
+        _expire_lease(conn, jid)
+
+        reclaimed = store.reclaim_expired_leases()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, stage, message FROM mse.jobs "
+                        "WHERE job_id = %s", (jid,))
+            got_status, got_stage, got_message = cur.fetchone()
+            # The worker's own gate, which is the thing that must have changed:
+            # before the fix a reclaim put this row back to 'queued' with no
+            # lease, so claim_jetson handed a FAILED job to a worker.
+            cur.execute("SELECT count(*) FROM mse.jobs WHERE job_id = %s "
+                        "AND status = 'queued' AND lease_owner IS NULL", (jid,))
+            claimable = cur.fetchone()[0]
+
+        r.check(
+            f"D3 a {status.upper()} row with an expired lease keeps its outcome "
+            f"(reclaim must judge the lease only while a worker holds the row)",
+            got_status == status and got_stage == status
+            and jid not in reclaimed and claimable == 0,
+            f"status={got_status!r} stage={got_stage!r} reclaimed="
+            f"{jid in reclaimed} claimable={claimable} -- want status/stage "
+            f"{status!r}, not reclaimed, and NOT claimable by a worker")
+
+        # The negative control the fix's SIBLING depends on: the stale lease
+        # must still be there for the startup repair to find. A leg that cleared
+        # it would leave D4 testing a row that needs no repair, and would hide a
+        # repair that stopped working.
+        r.check(
+            f"D3 the {status.upper()} row still carries the stale lease for the "
+            f"startup repair to retire (a leg that cleared it first would leave "
+            f"D4 testing nothing)",
+            got_message == message_before,
+            f"message {message_before!r} -> {got_message!r} (reclaim must not "
+            f"rewrite a terminal row)")
+
+
+def check_clear_terminal_leases_retires_legacy_leases(conn, r: Result, JobStore):
+    """D4: the startup repair clears terminal leases and destroys no message.
+
+    Two properties, and the second is the one that could hurt someone. The
+    first is that the repair does what it says: a terminal row with a dangling
+    lease stops looking alive. The second is that it changes NO job's outcome
+    and loses NO text -- it runs unattended at every web start, over every
+    row the owner has ever finished, so ``status``, ``stage`` and
+    ``finished_at`` must be untouched and the owner's message must survive.
+
+    The message half has a positive control in the same leg: a row WITH a
+    message must still contain it afterwards, and a row WITHOUT one must end
+    up holding the marker alone rather than a leading newline. Without the
+    first control, "the message is still there" would also pass on a repair
+    that did nothing at all.
+
+    ``running`` is the negative control, and it is load-bearing: a repair that
+    cleared every lease in the table would be catastrophic -- it would strip
+    the lease from the job a worker is solving right now -- and would pass a
+    leg that only ever inserted terminal rows.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid_failed = str(uuid.uuid4())
+    jid_done = str(uuid.uuid4())
+    jid_live = str(uuid.uuid4())
+
+    for jid in (jid_failed, jid_done, jid_live):
+        _insert_jetson_job(conn, jid)
+        if _claim_row(store, jid, owner=f"w-d4-{jid[:4]}") is None:
+            return r.check("D4 the seeding claim works", False,
+                           f"claim_jetson never returned {jid}")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE mse.jobs SET status = 'failed', stage = 'failed', "
+            "finished_at = now(), message = %s WHERE job_id = %s",
+            ("the GPU worker could not complete this job", jid_failed))
+        cur.execute(
+            "UPDATE mse.jobs SET status = 'done', stage = 'done', "
+            "finished_at = now(), message = NULL WHERE job_id = %s", (jid_done,))
+    conn.commit()
+
+    # A live row's deadline must survive too, so the repair is checked for the
+    # thing it must NOT touch, not only the thing it must.
+    with conn.cursor() as cur:
+        cur.execute("SELECT lease_expires_at FROM mse.jobs WHERE job_id = %s",
+                    (jid_live,))
+        live_before = cur.fetchone()[0]
+
+    cleared = store.clear_terminal_leases()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT job_id, status, lease_owner, COALESCE(message, '') "
+            "FROM mse.jobs WHERE job_id = ANY(%s::uuid[])",
+            ([jid_failed, jid_done, jid_live],))
+        rows = {str(a): (b, c, d) for a, b, c, d in cur.fetchall()}
+        cur.execute("SELECT lease_expires_at, lease_owner FROM mse.jobs "
+                    "WHERE job_id = %s", (jid_live,))
+        live_after_expiry, live_after_owner = cur.fetchone()
+
+    f_status, f_owner, f_msg = rows[jid_failed]
+    d_status, d_owner, d_msg = rows[jid_done]
+    l_status, l_owner, _ = rows[jid_live]
+
+    r.check("D4 the repair clears the dangling lease on terminal rows",
+            f_owner is None and d_owner is None and cleared >= 2,
+            f"cleared={cleared} failed_owner={f_owner!r} done_owner={d_owner!r}")
+
+    r.check("D4 it changes no job's OUTCOME -- a done row stays done, a failed "
+            "row stays failed",
+            f_status == "failed" and d_status == "done",
+            f"failed row -> {f_status!r}, done row -> {d_status!r}")
+
+    r.check("D4 it APPENDS to the owner's message rather than replacing it",
+            "the GPU worker could not complete this job" in f_msg
+            and f_msg.rstrip().endswith("restored"),
+            f"message={f_msg!r}")
+
+    r.check("D4 an empty message becomes the marker alone, not a blank line",
+            d_msg == "restored",
+            f"message={d_msg!r}")
+
+    r.check("D4 it leaves the LEASE of a RUNNING row alone (the negative "
+            "control: a repair that cleared every lease would strip the job a "
+            "worker is solving right now)",
+            l_status == "running" and l_owner is not None
+            and live_after_owner is not None
+            and live_after_expiry == live_before,
+            f"running row status={l_status!r} owner={l_owner!r} "
+            f"expiry {live_before} -> {live_after_expiry}")
+
+
+def check_a_terminal_row_serves_no_worker_write(conn, r: Result, JobStore):
+    """D5: the OTHER door -- the worker gate must refuse a terminal row too.
+
+    D3 pins ``reclaim_expired_leases``, but that is only one of the two places a
+    lease is judged. ``lease_held_by`` gates EVERY worker write through
+    ``_held``, and it originally checked only owner and expiry -- so a terminal
+    row left leased by the old ``mark_failed`` returned True and a worker was
+    waved through to write progress and results onto a job the owner had already
+    been told was over.
+
+    The assertion is the ``_held`` decision itself, not the columns, because
+    that is what a worker experiences: the 409 is what stops it. Mutation: drop
+    ``AND status = running`` and this leg goes red.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+    if _claim_row(store, jid, owner="w-d5") is None:
+        return r.check("D5 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    # The positive control FIRST, on the running row: the gate must be open
+    # while the worker legitimately holds it. Without this, "the gate refused"
+    # would also pass on a predicate that refuses everything.
+    held_running = store.lease_held_by(jid, "w-d5")
+
+    with conn.cursor() as cur:
+        cur.execute("UPDATE mse.jobs SET status = 'failed', stage = 'failed', "
+                    "finished_at = now() WHERE job_id = %s", (jid,))
+    conn.commit()
+
+    held_terminal = store.lease_held_by(jid, "w-d5")
+
+    r.check("D5 a worker holding the lease on a RUNNING row may write (the "
+            "positive control: a gate that refuses everything fails here)",
+            held_running is True,
+            f"lease_held_by on its own running row returned {held_running!r}")
+
+    r.check("D5 a worker is REFUSED on a row failed underneath it (a terminal "
+            "row must serve no worker write, even with the lease still set)",
+            held_terminal is False,
+            f"lease_held_by returned {held_terminal!r} for a FAILED row -- want "
+            f"False (the 409 that stops the worker)")
+
+
+def check_finish_writes_the_modes_and_the_status_atomically(conn, r: Result,
+                                                            JobStore):
+    """D7: DONE and the mode rows are ONE write, and a failure writes neither.
+
+    This is the leg that would have caught the bug the deploy-3 fix turns on,
+    and no Python double can exhibit it: a double reimplements the transaction,
+    so it passes on the working version AND on one that loses the rows.
+
+    **What provides the transaction, measured rather than assumed.** Three
+    shapes, each seeding ``[1]``, running ``DELETE`` then a failing INSERT, and
+    read back through an INDEPENDENT connection (a same-connection read cannot
+    tell a rollback from an uncommitted-but-open transaction):
+
+      A  ``autocommit=False`` + ``with conn``   -> ``[1]``  rolled back
+      B  ``autocommit=True``  + ``with conn``   -> ``[1]``  rolled back too
+      C  ``autocommit=True``, NO ``with conn``  -> ``[]``   THE TRAP
+
+    So the transaction comes from ``with conn`` -- psycopg2's context manager
+    issues BEGIN/ROLLBACK regardless of the autocommit flag -- and NOT from
+    ``autocommit = False``. An earlier version of this docstring claimed the
+    opposite and an earlier version of this leg could not tell A from B.
+
+    The leg therefore asserts the two things that are load-bearing: the
+    FAILURE path keeps the rows (which C breaks), and the SUCCESS path commits
+    them (which a missing commit breaks -- the other direction, and the one a
+    ``with conn`` that only ever rolled back would fail).
+    """
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+    if _claim_row(store, jid, owner="w-d7") is None:
+        return r.check("D7 the seeding claim works", False,
+                       f"claim_jetson never returned {jid}")
+
+    good = [(1, 1.0e6, 1.0e14, 1.0e-6), (2, 2.0e6, 2.0e14, 5.0e-7)]
+
+    # -- the happy path: the write must COMMIT -----------------------------
+    store.finish_jetson_with_modes(jid, "w-d7", good)
+    written = store.list_modes(jid)
+    with conn.cursor() as cur:
+        cur.execute("SELECT status FROM mse.jobs WHERE job_id = %s", (jid,))
+        status = cur.fetchone()[0]
+    r.check("D7 the happy path marks the row done AND writes every mode row",
+            status == "done" and len(written) == 2,
+            f"status={status!r} rows={len(written)} -- want done and 2")
+
+    # -- the failure path: the DELETE must be UNDONE -----------------------
+    # Re-open the row and seed it with a row that must survive the failure.
+    with conn.cursor() as cur:
+        cur.execute("UPDATE mse.jobs SET status = 'running', lease_owner = "
+                    "'w-d7', lease_expires_at = now() + interval '300 seconds', "
+                    "finished_at = NULL WHERE job_id = %s", (jid,))
+        cur.execute("DELETE FROM mse.modes WHERE job_id = %s", (jid,))
+        cur.execute(
+            "INSERT INTO mse.modes (job_id, mode_index, k0_per_m, freq_hz, "
+            "vacuum_wavelength_m) VALUES (%s, 1, 9.9, 9.9, 9.9)", (jid,))
+        # A CHECK constraint nothing in production uses, added only so the
+        # INSERT can fail on a row the store WILL send. This is deliberate: a
+        # ``None`` index raises TypeError in the row comprehension BEFORE the
+        # DELETE is reached, so it proves nothing about the transaction -- the
+        # first version of this leg made exactly that mistake and passed on the
+        # broken implementation too. The value has to survive the comprehension
+        # and die in the database.
+        cur.execute("ALTER TABLE mse.modes DROP CONSTRAINT IF EXISTS "
+                    "d7_no_absurd_k0")
+        cur.execute("ALTER TABLE mse.modes ADD CONSTRAINT d7_no_absurd_k0 "
+                    "CHECK (k0_per_m < 1e30)")
+    conn.commit()
+
+    broke = [(1, 1.0e6, 1.0e14, 1.0e-6), (2, 1.0e40, 2.0e14, 5.0e-7)]
+    raised = False
+    try:
+        store.finish_jetson_with_modes(jid, "w-d7", broke)
+    except Exception:  # noqa: BLE001 - any failure is the case under test
+        raised = True
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE mse.modes DROP CONSTRAINT IF EXISTS "
+                        "d7_no_absurd_k0")
+        conn.commit()
+
+    # Read through a FRESH connection, so what it sees is committed state.
+    independent = JobStore(dsn=DSN_OF[0])
+    survived = independent.list_modes(jid)
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, lease_owner FROM mse.jobs WHERE job_id = %s",
+                    (jid,))
+        status, owner = cur.fetchone()
+
+    r.check("D7 the broken INSERT raises rather than reporting success",
+            raised is True,
+            "finish_jetson_with_modes returned normally on a value the column "
+            "rejects -- the failure never happened, so the rollback was never "
+            "exercised")
+    r.check("D7 a failed write leaves the job's EXISTING mode rows in place "
+            "(the DELETE and the INSERT are one transaction; autocommit with no "
+            "`with conn` commits the DELETE and loses them)",
+            len(survived) == 1 and survived[0]["freq_hz"] == 9.9,
+            f"a fresh connection sees {survived!r} -- want the one seeded row")
+    r.check("D7 a failed write also leaves the job NOT done and still leased",
+            status == "running" and owner == "w-d7",
+            f"status={status!r} lease_owner={owner!r} -- want running/w-d7")
+
+
+def check_the_two_connection_paths_differ_only_in_autocommit(r: Result,
+                                                            JobStore):
+    """D8: every connection JobStore opens is built the same way.
+
+    ``_connect`` and ``finish_jetson_with_modes`` share ``_open`` so they cannot
+    drift. The consequence of a drift is invisible in the passing suite: the
+    transaction that must roll back would not, and a job would lose its modes on
+    a failure that looks like nothing happened. This leg pins the property
+    directly -- the two connections agree on everything except the one knob the
+    caller chooses.
+
+    Asserted through the store's OWN ``dsn``, read by the same rule libpq
+    applies, rather than by retyping the host and port here.
+    """
+    store = JobStore(dsn=DSN_OF[0])
+
+    def identity(conn):
+        """The connection's real parameters, as libpq reports them.
+
+        ``conn.info`` rather than attributes on the connection: psycopg2 exposes
+        no ``.host``/``.port`` on the connection itself, and reaching for them
+        is how this leg first reported COULD-NOT-RUN instead of a verdict.
+        ``password`` is not on ``info`` (it is not a server-visible fact), so it
+        is read back from the connection's own DSN instead.
+        """
+        return {
+            "host": conn.info.host, "port": str(conn.info.port),
+            "dbname": conn.info.dbname, "user": conn.info.user,
+            "password": conn.dsn.split("password=")[1].split()[0],
+        }
+
+    with store._connect() as default_conn:
+        plain = store._open(autocommit=False)
+        try:
+            same = {f: identity(default_conn)[f] == identity(plain)[f]
+                    for f in ("host", "port", "dbname", "user", "password")}
+            plain_autocommit = plain.autocommit
+        finally:
+            plain.close()
+        default_autocommit = default_conn.autocommit
+
+    r.check("D8 the two connection paths are the same connection in every "
+            "respect but autocommit",
+            all(same.values()),
+            f"the params differ on {[f for f, ok in same.items() if not ok]}")
+    r.check("D8 _connect is autocommit and the writing path is NOT (the whole "
+            "reason there are two paths)",
+            default_autocommit is True and plain_autocommit is False,
+            f"_connect autocommit={default_autocommit!r} "
+            f"_open(False) autocommit={plain_autocommit!r} -- want True/False")
+
+
+def check_the_real_worker_client_against_the_real_app(conn, r: Result,
+                                                      JobStore):
+    """Gap B: the worker's OWN HTTP client, against the app's OWN routes.
+
+    Every other leg here calls ``JobStore`` methods directly, and every leg in
+    ``tests/test_worker.py`` drives ``WorkerAPI`` against a double. So the two
+    halves are each covered and the SEAM between them is not: nothing runs the
+    real urllib client against the real Flask routes against the real store.
+    The reviewer ran exactly this path by hand and it passed, which is why this
+    is a COVERAGE leg and not a bug fix -- but a seam with no automated leg is a
+    seam that regresses silently, and the deploy-3 precedent in this repo is
+    precisely a set of components that were each green alone.
+
+    What this leg can fail on that no other can: a route spelling that the
+    client does not use, a claim payload field the client reads under a
+    different name, a 409 mapping that the client translates wrongly, and the
+    ''/progress after the app failed the job'' transition that is the whole
+    lease contract.
+
+    **The double is what makes that last one demonstrable.** After the app fails
+    the job, the leg re-opens the lease with a direct SQL UPDATE and asserts the
+    worker is served a 409 again. Without that, "the gate refused" would also
+    pass on a store that had simply deleted its lease row -- the refusal has to
+    come from the STATUS, not from the absence of a lease.
+
+    Asserted through the client's own exceptions (``LeaseLost``), not through
+    its returned dicts, because the exception is what a real caller branches on:
+    a route that returned 409 but a client that swallowed it would look
+    identical from the JSON alone.
+    """
+    import io  # noqa: PLC0415
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
+
+    import mse_db_shim  # noqa: PLC0415
+    import mse_worker  # noqa: PLC0415
+
+    # The APP's worker blueprint, loaded by the shim as part of web/app.py's
+    # imports. ``owner_id`` is used rather than re-derived here so the owner the
+    # leg claims under and the owner it fails under cannot drift apart.
+    import worker_api  # noqa: PLC0415
+    from werkzeug.test import Client  # noqa: PLC0415
+
+    # The token is set HERE, for this process only, and never printed. It is a
+    # throwaway for a disposable database -- but the habit is what matters: the
+    # rig's rule is that a real token never reaches argv or a log, and a check
+    # that broke that rule for convenience would be the wrong example.
+    TOKEN = "pg-check-" + uuid.uuid4().hex
+    os.environ["MSE_WORKER_TOKEN"] = TOKEN
+    # ``web/config.py`` reads this from the environment and refuses to default
+    # it (the old default was the scalar solver, which would return wrong modes
+    # silently). Loading the app therefore needs a value even though nothing
+    # here launches a Job -- the launcher is constructed eagerly at import.
+    # Set only if the caller has not, so a real deployment value still wins.
+    os.environ.setdefault("MSE_SOLVER_IMAGE", "pg-check-no-such-image:0")
+
+    store = JobStore(dsn=DSN_OF[0])
+    jid = str(uuid.uuid4())
+    _insert_jetson_job(conn, jid)
+    # The input the worker fetches. Written through the PROJECT's key helper so
+    # this cannot disagree with the route about where it lives.
+    input_bytes = b"# wedge\nv 0 0 0\n"
+
+    with tempfile.TemporaryDirectory(prefix="pgcheck-worker-") as tmp:
+        app_mod = mse_db_shim.load_app_module()
+        storage_mod = sys.modules.get("storage")
+        if storage_mod is None:
+            raise AssertionError(
+                "storage did not import alongside web/app.py; without it this "
+                "leg cannot write the input the fetch route reads")
+        local = storage_mod.LocalStore(tmp)
+        local.write(storage_mod.job_key(jid, "input.obj"), input_bytes)
+
+        # The REAL app: real Flask, real routes, real JobStore (the store comes
+        # from MSE_DSN, not a mock), real LocalStore. The launcher is left out
+        # deliberately -- no leg here launches anything, and a real launcher
+        # would try to reach a cluster this check must not touch.
+        app, _s, jobs_db, _l = app_mod.create_app({
+            "TESTING": True,
+            "MSE_DSN": DSN_OF[0],
+            "MSE_LOCAL_STORE": tmp,
+        })
+        if jobs_db is None:
+            raise AssertionError("create_app returned no jobs db")
+
+        client = Client(app)
+        api = mse_worker.WorkerAPI("http://worker.invalid", TOKEN,
+                                   timeout=30.0)
+
+        # Route the client's urllib requests into the WSGI app. This is the
+        # whole point: the client's OWN ``_request`` builds a real
+        # ``urllib.request.Request`` with a real Authorization header, and that
+        # request is what the real route authorises.
+        def _opener(request, timeout=None):  # noqa: ARG001
+            """Deliver one worker request to the real WSGI app.
+
+            The non-2xx branch is the whole point of writing this rather than
+            calling the client against a real socket: ``urllib`` RAISES
+            ``HTTPError`` for a 4xx/5xx, and the client's ``_request`` catches
+            exactly that to build its ``APIError`` -- which ``progress()``
+            inspects for ``status == 409`` to raise ``LeaseLost``.
+
+            An earlier version of this function returned the Flask response
+            object for every status, and Werkzeug's ``Client.open`` does NOT
+            raise on a 4xx. So a 409 arrived at the client shaped exactly like a
+            200, ``progress()`` returned normally, and the leg reported "the
+            client did not see LeaseLost" -- blaming the code for the shim's
+            silence. That is this rig's could-not-ask failure in its usual
+            costume: a sub-200 that cannot be distinguished from a success.
+            """
+            method = request.get_method()
+            path = ("/" + request.full_url.split("//", 1)[1].split("/", 1)[1]
+                    if "//" in request.full_url else "/")
+            headers = dict(request.header_items())
+            body = request.data
+            resp = Client(app).open(path, method=method, headers=headers,
+                                    data=body,
+                                    content_type=headers.get("Content-type"))
+            if resp.status_code >= 300:
+                # Exactly what urlopen does: raise, with the body readable.
+                raise urllib.error.HTTPError(
+                    request.full_url, resp.status_code,
+                    f"HTTP {resp.status_code}", resp.headers,
+                    io.BytesIO(resp.get_data()))
+            return _FakeURLResponse(resp)
+
+        import urllib.request  # noqa: PLC0415
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = _opener
+        try:
+            claimed = api.claim()
+            r.check("B the real worker client claims a job through the real "
+                    "app and the real store",
+                    claimed is not None and claimed.get("job_id") == jid,
+                    f"claim() returned {claimed!r}; want job_id {jid}")
+
+            # The input route, through the client.
+            fetched = api.fetch_input(jid)
+            r.check("B the real client fetches the input through the real "
+                    "input route, byte for byte",
+                    fetched == input_bytes,
+                    f"fetch_input returned {fetched!r}; want {input_bytes!r}")
+
+            # A real tick. The app's own reaper must not touch a job this
+            # worker is actively holding -- the D2 property, now exercised
+            # through the route the worker actually uses rather than the store.
+            tick = app_mod.run_tick(local, jobs_db, None, log=lambda *_: None)
+            still = store.get(jid) if hasattr(store, "get") else None
+            if still is None:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT status, lease_owner FROM mse.jobs "
+                                "WHERE job_id = %s", (jid,))
+                    still = cur.fetchone()
+                still = {"status": still[0], "lease_owner": still[1]}
+            r.check("B a real tick leaves a job this worker is holding alone",
+                    still.get("status") == "running",
+                    f"after run_tick the row is {still!r}; a tick that reclaims "
+                    f"a live claim is the D2 defect")
+            r.check("B the tick did not strand the job either (it is still "
+                    "claimable by none, because it is still running)",
+                    tick is not None, f"run_tick returned {tick!r}")
+
+            # The heartbeat, through the client. This is the lease renewal; if
+            # the client's stage payload were malformed the route would 400 and
+            # every long solve would lose its lease.
+            api.progress(jid, "meshing")
+            r.check("B the real client renews the lease through the real "
+                    "/progress route", True, "progress() did not raise")
+
+            # The app fails the job underneath the worker, through the APP'S
+            # OWN route -- not a hand-written UPDATE.
+            #
+            # This distinction is the whole reason this leg is worth having, and
+            # the first version got it wrong. A synthetic ``UPDATE ... status =
+            # 'failed'`` that leaves ``lease_owner`` set produces a state the
+            # real app does not make: every app-side terminal path clears the
+            # lease in the same statement (``fail_jetson`` and ``mark_failed``
+            # both say so, and why). Against that fabricated row,
+            # ``renew_lease`` -- which is guarded on the OWNER only -- still
+            # returned True and this leg reported a defect that does not exist.
+            #
+            # The 409 the worker depends on is delivered by the LEASE CLEAR, not
+            # by a status filter on the heartbeat. So the leg must drive the
+            # real route and assert the real mechanism; anything else is testing
+            # a row the app cannot produce.
+            # The owner id is derived from the token by the APP's own helper, so
+            # this cannot disagree with what the claim route recorded.
+            failed_ok = jobs_db.fail_jetson(jid, worker_api.owner_id(TOKEN),
+                                            "failed by the app")
+            r.check("B the app fails the job through its own terminal path",
+                    failed_ok is True,
+                    f"fail_jetson returned {failed_ok!r}; it is guarded on the "
+                    f"lease owner, so False means the worker's owner id and the "
+                    f"row's disagree and the rest of this leg proves nothing")
+            with conn.cursor() as cur:
+                cur.execute("SELECT status, lease_owner FROM mse.jobs "
+                            "WHERE job_id = %s", (jid,))
+                status, owner_after = cur.fetchone()
+            r.check("B the app's failure CLEARS the lease (that clear is the "
+                    "mechanism that turns the next heartbeat into a 409)",
+                    status == "failed" and owner_after is None,
+                    f"after fail_jetson status={status!r} lease_owner="
+                    f"{owner_after!r} -- want 'failed'/None")
+
+            # THE ASSERTION THAT MATTERS: the next heartbeat is refused, and
+            # the client translates 409 into LeaseLost -- which is the contract
+            # ``beat()`` in mse_worker.py branches on.
+            lost = False
+            try:
+                api.progress(jid, "uploading")
+            except mse_worker.LeaseLost:
+                lost = True
+            except Exception as exc:  # noqa: BLE001
+                r.check("B /progress on a failed job raises LeaseLost",
+                        False, f"raised {type(exc).__name__}: {exc}")
+            r.check("B the real client sees LeaseLost when the app has failed "
+                    "the job underneath it (a 409 the client must translate, "
+                    "not swallow)",
+                    lost,
+                    "progress() raised LeaseLost, which is what stops the "
+                    "worker solving a dead job" if lost
+                    else "progress() did NOT raise LeaseLost on a terminal row; "
+                         "the worker would keep beating forever")
+
+            # The positive control for the line above. It must run BEFORE the
+            # failure and on the SAME client, or "it raised" would also pass on
+            # a client that raises unconditionally. It was already run above --
+            # "the real client renews the lease" -- on this client and this job,
+            # while the row was still running. That is the control, and it is
+            # deliberately not repeated here: re-opening the row by hand would
+            # mean asserting against a state the app does not produce, which is
+            # the mistake this leg was rewritten to remove.
+        finally:
+            urllib.request.urlopen = original
+
+    # Plain-language summary line, so a reader of the log sees the seam named.
+    r.check("B the worker client / real app / real store seam was exercised "
+            "end to end", True,
+            "claim -> input -> tick -> progress -> 409 LeaseLost")
+
+
+class _FakeURLResponse:
+    """The slice of ``http.client.HTTPResponse`` the worker client uses.
+
+    ``urllib.request.urlopen`` returns something with ``.status``, ``.read()``
+    and ``.headers``; the client touches exactly those. A real socket is not
+    needed because the route under test IS the real one -- only the transport is
+    substituted, and this class is small enough that a gap in it shows up as an
+    AttributeError rather than a silent pass.
+    """
+
+    def __init__(self, flask_response):
+        self._resp = flask_response
+        self.status = flask_response.status_code
+        self.headers = flask_response.headers
+
+    def read(self) -> bytes:
+        return self._resp.get_data()
+
+    def getcode(self) -> int:
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def close(self):
+        pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Race/lease checks against a throwaway Postgres. The "
+                    "connection is read from DATABASE_URL or the standard "
+                    "PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE variables; "
+                    "there is deliberately no --dsn flag.")
+    ap.add_argument("--bound", type=int, default=3,
+                    help="release bound the code uses (default 3)")
+    args = ap.parse_args()
+
+    import os  # noqa: PLC0415
+
+    import psycopg2  # noqa: PLC0415
+    from psycopg2.extensions import parse_dsn  # noqa: PLC0415
+    from mse_db_shim import load_app_module, load_db_module  # noqa: PLC0415
+
+    # The connection is assembled from the ENVIRONMENT so no password ever
+    # appears on argv, where any seat's `ps` can read it. Building the dict
+    # ourselves (rather than handing psycopg2.connect() no arguments and letting
+    # libpq pick the variables up) is what makes the checking possible: we need
+    # the same values as a parsed dict for JobStore, and we want to refuse
+    # loudly when nothing is configured rather than let libpq silently fall back
+    # to a local socket and a same-named role.
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url:
+        # psycopg2's own parser, so the URL is read exactly as connect() would.
+        params = parse_dsn(url)
+    else:
+        params = {k: os.environ.get(f"PG{k.upper()}", "")
+                  for k in ("host", "port", "dbname", "user", "password")}
+    dsn = {
+        "host": params.get("host") or "localhost",
+        "port": params.get("port") or "5432",
+        "dbname": params.get("dbname") or "postgres",
+        "user": params.get("user") or "postgres",
+        "password": params.get("password") or "",
+    }
+    if not url and not any(os.environ.get(f"PG{k.upper()}")
+                           for k in ("host", "dbname", "user")):
+        raise SystemExit(
+            "No connection configured. Set DATABASE_URL, or at least PGHOST/"
+            "PGDATABASE/PGUSER. This check must be pointed at a THROWAWAY "
+            "Postgres -- it writes to the schema and does not clean up.")
+
+    DSN_OF[0] = dsn
+    r = Result()
+    conn = psycopg2.connect(**dsn)
+    try:
+        db_module = load_db_module()
+        JobStore = db_module.JobStore
+        # Print the code's OWN bound rather than assuming it equals --bound. The
+        # legs assert against the bound they exercise; if the constant drifts
+        # from the default this line is how the reader sees it, and every leg
+        # that reads web/db.py's constant would go red instead of being tuned by
+        # a flag that the code never reads.
+        print(f"      (web/db.py MAX_RELEASES = {db_module.MAX_RELEASES}; "
+              f"--bound {args.bound} is what the legs assert)")
+        JobStore(dsn=dsn).apply_schema()   # the PROJECT's own path
+        print("schema applied via web/db.py:JobStore.apply_schema()")
+        check_claim_columns(conn, r, JobStore)
+        check_feature_triplet_roundtrip(conn, r, JobStore)
+        check_upgrade_matches_a_fresh_schema(conn, r, JobStore, db_module)
+        check_release_bound(conn, r, args.bound, dsn, JobStore, db_module)
+        # The expiry path is its own route (a worker that DIES never calls
+        # /release), so it gets its own legs rather than reusing the release
+        # ones with a different caller.
+        check_expiry_requeues_the_job(conn, r, JobStore)
+        check_expiry_bound_is_terminal(conn, r, JobStore, args.bound)
+        # The APP-side paths, which no leg above touches: the app failing a row
+        # on its own initiative, and the tick judging a lease-owned Jetson row.
+        # The dispatch rollback lived here and every unit test was green.
+        check_mark_failed_clears_the_lease(conn, r, JobStore)
+        # D2 is invoked on its own line so a traceback names IT rather than the
+        # call site. The module-level handler prints only ``type: message``, and
+        # an AssertionError raised inside a helper reads as "the check did not
+        # execute" with no line -- which is exactly how a D2 that never ran was
+        # first read as a D2 that failed.
+        check_a_claimed_jetson_job_is_not_reaped_by_the_tick(conn, r, JobStore,
+                                                             load_app_module())
+        # D3/D4: the OTHER direction of the same lease. D1/D2 are about a
+        # worker being stopped; these are about a terminal job being brought
+        # back. Found live at 20:15Z, the same class as the bugs above, and
+        # likewise invisible to a unit test that drives a double.
+        check_terminal_rows_are_never_reclaimed(conn, r, JobStore)
+        check_clear_terminal_leases_retires_legacy_leases(conn, r, JobStore)
+        # D5: the worker gate's half. D3 stops a terminal row being REQUEUED;
+        # this stops one being SERVED. Both must refuse, or the worker still
+        # writes onto a job the owner was told was over.
+        check_a_terminal_row_serves_no_worker_write(conn, r, JobStore)
+        # D7/D8: the /done write itself. D7 is the atomicity the deploy-3 fix
+        # rests on, and the one property a tier-1 double structurally cannot
+        # exhibit -- a double reimplements the transaction, so it passes on the
+        # working version AND on the autocommit version that loses the rows.
+        check_finish_writes_the_modes_and_the_status_atomically(conn, r, JobStore)
+        check_the_two_connection_paths_differ_only_in_autocommit(r, JobStore)
+        # Gap B: the SEAM between the halves above. Every leg to this point
+        # calls JobStore directly; tests/test_worker.py drives WorkerAPI
+        # against a double. Neither runs the real client against the real app
+        # routes, which is where a spelling or payload drift lives.
+        check_the_real_worker_client_against_the_real_app(conn, r, JobStore)
+    finally:
+        conn.close()
+    print("RESULT:", "PASS" if r.ok else "FAIL")
+    return 0 if r.ok else 1
+
+
+if __name__ == "__main__":
+    try:
+        _rc = main()
+    except Exception as _exc:  # noqa: BLE001 - this is the point
+        print(f"COULD-NOT-RUN: {type(_exc).__name__}: {_exc}")
+        print("RESULT: FAIL (the check did not execute; this is NOT a pass)")
+        sys.exit(2)
+    sys.exit(_rc)

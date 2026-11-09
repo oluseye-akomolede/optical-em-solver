@@ -1,0 +1,1207 @@
+"""Postgres access for the web app: the ``mse`` schema and the upload queue.
+
+A deliberate near-twin of ``dockerfiles/maxwell_solver/mse_db.py``: the two
+components ship as separate images, so the app does not import the solver
+package. The duplicated part is a dozen lines of connection handling; the SQL is
+kept identical by hand and both sides are parameterised -- no value is ever
+interpolated into a statement.
+
+Uploads that are waiting to run live here: an upload row is created with status
+``queued`` and the background tick promotes the oldest one when no solver Job is
+running.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+#: job states. `queued` is ours (waiting for the single Job slot); the rest are
+#: written by the solver as it moves through its stages.
+QUEUED = "queued"
+RUNNING = "running"
+DONE = "done"
+FAILED = "failed"
+
+#: terminal states
+FINISHED = (DONE, FAILED)
+
+#: The startup repair of dangling leases on terminal rows. Not a job state --
+#: it is what ``clear_terminal_leases`` writes back into ``message`` so the
+#: rewrite is visible in the row instead of silent. See that method.
+RESTORED = "restored"
+
+#: which machine a job is for. ``cluster`` is a k8s Job (the pre-routing default,
+#: and what every existing row did); ``jetson`` waits for a GPU worker to claim
+#: it through the worker API.
+#:
+#: ``cluster-gpu`` is a k8s Job that requests one RTX A4000. It exists because
+#: the Jetson is an edge device with one small GPU, while the cluster has idle
+#: A4000s (owner, 2026-11-02). It shares the ``cluster`` launcher and differs
+#: only in the manifest it asks for.
+#:
+#: The column stores a plain string, so adding a value needs no migration and
+#: every existing row keeps meaning what it meant.
+CLUSTER = "cluster"
+JETSON = "jetson"
+CLUSTER_GPU = "cluster-gpu"
+TARGETS = (CLUSTER, JETSON, CLUSTER_GPU)
+
+#: The two targets that are k8s Jobs in this namespace, and so are launched and
+#: reaped by the cluster machinery rather than claimed by the Jetson worker.
+#: Named as a set so a new Job target cannot be forgotten at one of the several
+#: ``== CLUSTER`` call sites. See :data:`GPU_TARGETS`.
+CLUSTER_TARGETS = (CLUSTER, CLUSTER_GPU)
+
+#: Targets that occupy the single GPU quota slot.
+GPU_TARGETS = (CLUSTER_GPU,)
+
+#: What KIND of solve a job is. ``cavity`` is the 3-D vector solver this table
+#: has always held and is the DEFAULT on the column, so every row written before
+#: the column existed is truly a cavity job rather than a guessed one; ``pc`` is
+#: a 2-D photonic-crystal band diagram.
+#:
+#: This is a ROUTE as well as a label, and it is deliberately not folded into
+#: ``target``: ``target`` says WHICH MACHINE (and `pc` runs on the same Jetson
+#: worker, on CPU), while ``kind`` says WHICH PROGRAM that machine runs. A
+#: single column spelling both would make "jetson" stop meaning "the machine
+#: the worker polls" and start meaning "whichever of the two solves happens to
+#: be the default today".
+CAVITY = "cavity"
+PC = "pc"
+#: ``td`` is a 3-D time-domain (FDTD) run of the upload. It runs on the Jetson
+#: GPU and nowhere else: the cluster has no FDTD solver, so like ``pc`` it must
+#: never reach the cluster launcher. Its request lives in ``tds``.
+TD = "td"
+KINDS = (CAVITY, PC, TD)
+
+#: How many times a jetson job may be handed back with no verdict before it is
+#: failed for good. Releases are legitimate for transient reasons; an unbounded
+#: number of them is an infinite loop, so there is a cap. Three is enough for a
+#: genuine restart or a flapping network to clear without a human, and small
+#: enough that a genuinely broken job reaches a terminal state quickly instead
+#: of cycling through the GPU queue forever.
+MAX_RELEASES = 3
+
+#: How long a td job may wait as "Jetson busy" (short of GPU memory at start)
+#: before it fails, measured from its first deferral; and how long each
+#: deferral keeps it out of the claim query. The spec's 60 minutes.
+BUSY_WAIT_MINUTES = 60
+BUSY_RETRY_SECONDS = 60
+BUSY_STAGE = "Jetson busy"
+BUSY_GAVE_UP_MESSAGE = (
+    f"The Jetson stayed short of GPU memory for {BUSY_WAIT_MINUTES} minutes "
+    "(other work was using it), so this run never started. Please try again "
+    "later."
+)
+
+
+def _busy_message(reason: str) -> str:
+    """The row's message while a td job waits for GPU memory."""
+    reason = (reason or "not enough free GPU memory to start").strip()
+    return (f"waiting: the Jetson is busy ({reason}); it will try again for up "
+            f"to {BUSY_WAIT_MINUTES} minutes")
+
+
+def releases_are_terminal(count: int, bound: int = MAX_RELEASES) -> bool:
+    """Whether ``count`` releases have used up the allowance and the job is done.
+
+    The bound as a PREDICATE rather than a comparison repeated at each of the
+    three sites that enforce it (``release_jetson``, ``reclaim_expired_leases``
+    and the SQL's own ``WHERE ... < %s``). It exists so the bound can be checked
+    without driving a whole claim/release loop: a check that can only reach the
+    bound by running the loop cannot tell a working bound from one that is
+    decorative, because a guard that always returns False never fires and a test
+    that never observes it firing still passes.
+
+    ``count`` is the number of releases ALREADY recorded, so ``MAX_RELEASES``
+    releases are permitted and the next one is over: ``releases_are_terminal(3,
+    3)`` is True, ``(2, 3)`` is False. This is the same comparison the SQL makes
+    -- ``release_count < bound`` allows the write, so a row AT the bound takes
+    the failure branch.
+    """
+    return int(count) >= int(bound)
+
+
+def _retry_message(reason: str, bound: int, attempt: int | None = None) -> str:
+    """The row's message while a job is RETRYING, so the owner can see why.
+
+    A transient release puts the job back in the queue, and without this the row
+    looks identical to a fresh upload -- the owner sees a job that has been
+    waiting a long time with no explanation of what it is waiting for. The
+    attempt number is the point: "retrying (attempt 2 of 3)" says the job has a
+    finite number of further chances, which a bare reason does not.
+    """
+    reason = (reason or "the GPU worker could not finish this attempt").strip()
+    if attempt is None:
+        return f"retrying: {reason}"
+    return f"retrying (attempt {int(attempt)} of {int(bound)}): {reason}"
+
+
+def _terminal_message(reason: str, attempts: int) -> str:
+    """The FAILED message: what went wrong AND that no further attempt is coming.
+
+    Both halves matter and neither is inferable from the other. The reason names
+    the immediate cause; the bound sentence is what tells the owner the job is
+    genuinely over rather than one more retry away.
+    """
+    reason = (reason or "").strip()
+    bound = (f"the GPU worker could not complete this job after "
+             f"{int(attempts)} attempts; try again later")
+    return f"{reason} ({bound})" if reason else bound
+
+
+def dsn_from_env() -> dict:
+    """Connection parameters from the environment (never from a file)."""
+    return {
+        "host": os.environ.get("DB_HOST", "localhost"),
+        "port": os.environ.get("DB_PORT", "5432"),
+        "dbname": os.environ.get("DB_NAME", "mode_search_engine"),
+        "user": os.environ.get("DB_USER"),
+        "password": os.environ.get("DB_PASSWORD"),
+    }
+
+
+#: filename of the DDL script, and where it lives relative to this module.
+SCHEMA_FILENAME = "001_schema.sql"
+
+
+def schema_candidates() -> list[str]:
+    """Every path the DDL script may live at, most specific first.
+
+    The script sits next to this module's directory in **both** layouts, but at
+    a different depth, and climbing a fixed number of levels is what broke the
+    deployed image:
+
+    * image: ``web/`` is copied to ``/opt/app/`` and ``db/`` to ``/opt/app/db/``,
+      so the script is ``<module dir>/db/001_schema.sql``.
+    * repo: this file is ``web/db.py`` and the script is ``repo/db/``, so it is
+      ``<module dir>/../db/001_schema.sql``.
+
+    ``MSE_SCHEMA_PATH`` wins if set, so an operator can point at a mounted copy
+    without rebuilding. The caller reports every candidate it tried, because a
+    bare FileNotFoundError naming one wrong path is what made this hard to see.
+    """
+    override = os.environ.get("MSE_SCHEMA_PATH")
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "db", SCHEMA_FILENAME),              # image layout
+        os.path.join(os.path.dirname(here), "db", SCHEMA_FILENAME),  # repo layout
+    ]
+    if override:
+        candidates.insert(0, override)
+    return candidates
+
+
+def _schema_path() -> str:
+    """The first candidate that is a real file. Raises if none are.
+
+    ``isfile``, not ``exists``: a directory passes ``exists`` and then fails at
+    ``open`` with an unexplained IsADirectoryError, which defeats the point of
+    reporting every candidate tried.
+    """
+    candidates = schema_candidates()
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "could not find " + SCHEMA_FILENAME + "; looked in: "
+        + ", ".join(candidates)
+    )
+
+
+class JobStore:
+    """Thin wrapper around ``mse.jobs`` / ``mse.modes``.
+
+    Creates a fresh connection per operation. The app is one replica serving one
+    owner, and the jobs are minutes apart, so a connection pool would be more
+    moving parts than the traffic justifies -- and it keeps the background tick
+    from holding a connection open while Flask is idle.
+    """
+
+    def __init__(self, dsn: dict | None = None):
+        self.dsn = dsn or dsn_from_env()
+
+    def _open(self, autocommit: bool = True):
+        """A new connection, with the ONE knob that differs between callers.
+
+        Every connection this class opens is built here -- same DSN source, same
+        options -- so ``autocommit`` is the only thing a caller can get wrong,
+        and ``_connect`` and ``finish_jetson_with_modes`` cannot drift apart. The
+        check ``check_the_two_connection_paths_differ_only_in_autocommit`` in
+        ``tests/pg_race_check.py`` exists because a divergence here is silent:
+        it would show up as a transaction that does not roll back, which is a
+        data-loss bug, not an error. It needs Postgres, so it is a tier-2 check
+        and not part of the default suite.
+        """
+        import psycopg2
+
+        conn = psycopg2.connect(
+            host=self.dsn["host"], port=self.dsn["port"],
+            dbname=self.dsn["dbname"], user=self.dsn["user"],
+            password=self.dsn["password"],
+        )
+        conn.autocommit = autocommit
+        return conn
+
+    @contextmanager
+    def _connect(self):
+        conn = self._open(autocommit=True)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    # -- schema ------------------------------------------------------------
+    def apply_schema(self, path: str | None = None) -> None:
+        """Apply ``db/001_schema.sql`` idempotently (runs in the initContainer)."""
+        with open(path or _schema_path(), encoding="utf-8") as fh:
+            sql = fh.read()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql)
+
+    def clear_terminal_leases(self) -> int:
+        """Retire leases left dangling on TERMINAL rows. Returns how many.
+
+        LEGACY-DATA REPAIR, run once at startup. Rows failed by the old
+        ``mark_failed`` kept their lease, and such a row is a live trap even now
+        that ``reclaim_expired_leases`` filters on ``status = %s`` -- because the
+        worker API is a SEPARATE path that judges a row by its lease too. Leaving
+        the row claimable-but-terminal is the defect; this removes the only field
+        that makes it look alive.
+
+        **It cannot change a job's outcome, and that is why it is safe to run
+        unattended.** ``status``, ``stage`` and ``finished_at`` are untouched: a
+        done row stays done, a failed row stays failed. Only ``lease_owner`` and
+        ``lease_expires_at`` -- bookkeeping that should already have been NULL on
+        a terminal row -- are cleared.
+
+        **``message`` is APPENDED to, never replaced, and that is the whole
+        difference between a repair and a data loss.** There is nowhere else for
+        the old text to live -- this schema has no events table, and
+        ``finished_at`` says only *when* a row ended, not what it said. An
+        earlier draft of this method wrote the marker over the message, which
+        would have silently destroyed the one thing a FAILED row exists to carry:
+        the reason the owner was given. So the line is appended to whatever is
+        already there, which is both lossless and visible on the page the owner
+        is already reading. An empty message becomes the marker alone rather
+        than an empty string with a leading newline.
+
+        ``status = ANY(%s)`` over ``FINISHED`` rather than two ``= %s`` ORs: the
+        set of terminal states is already named once in ``FINISHED``, and a
+        third terminal state added later is then covered here automatically
+        instead of becoming a fresh dangling-lease hole.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "message = CASE WHEN message IS NULL OR message = '' THEN %s "
+                "               ELSE message || E'\\n' || %s END "
+                "WHERE status = ANY(%s) AND lease_owner IS NOT NULL",
+                (RESTORED, RESTORED, list(FINISHED)),
+            )
+            return int(cur.rowcount)
+
+    # -- writes ------------------------------------------------------------
+    def create_job(self, job_id, original_filename: str, units: str,
+                   n_index: float, n_modes: int, target: str = CLUSTER,
+                   est_tets: int | None = None,
+                   min_feature_m: float | None = None,
+                   min_feature_value: float | None = None,
+                   min_feature_unit: str | None = None,
+                   scale: float = 1.0,
+                   materials: dict | None = None,
+                   kind: str = CAVITY,
+                   pcs: dict | None = None,
+                   tds: dict | None = None) -> None:
+        """Create the upload row. Status starts ``queued``, not ``running``.
+
+        ``target`` is the machine the upload-time estimate chose. It is recorded
+        rather than recomputed later because the estimate is the *decision*, and
+        a wrong route is diagnosed by comparing it against the count the solver
+        reports. A job queued for the Jetson also gets ``gpu_queued_at``, which
+        is what the fallback timer counts from.
+
+        The three feature columns are recorded because they are *inputs* to the
+        mesh, not derivable from what is stored -- the same .obj at scale 1000 is
+        a different object, and a job whose frequency looks wrong by 1000x is
+        diagnosed by reading this row, not by re-reading the upload.
+
+        All three are stored, not just the canonical one, because the number the
+        owner typed is not recoverable from its metre value once the unit is
+        gone: 0.2 mm and 2e-4 m are the same length, and a row that kept only
+        ``min_feature_m`` could not say which the owner meant to type. The
+        four-ways-of-stating-the-units ambiguity that caused this bug is closed
+        by the row carrying value, unit AND metres explicitly.
+
+        ``min_feature_m`` is the only one the solver sees; the other two exist
+        so the page can show the owner their own input back.
+
+        ``materials`` is the part-name -> ``n`` table, or ``None`` for a one-part
+        vacuum upload. ``None`` is stored as SQL NULL rather than ``{}``: an empty
+        object would say the owner submitted a table with no parts in it, which
+        is a different statement from "there is no table". It is serialised here
+        with ``json.dumps`` because psycopg2 does not adapt a dict for a jsonb
+        parameter on its own, and a silently stringified dict would be a jsonb
+        scalar that every reader then has to parse back out.
+
+        ``kind`` is the solve program and ``pcs`` is the photonic-crystal
+        request; both default to the cavity path, so every caller that predates
+        photonic crystals keeps writing exactly what it wrote before. ``pcs``
+        follows ``materials`` in being stored as NULL rather than ``{}`` for the
+        absent case, and for the same reason: ``{}`` would be a request with
+        every field missing, which is a claim rather than an absence. It is
+        serialised with ``json.dumps`` here for the same psycopg2 reason too.
+        ``tds`` is the time-domain request and follows ``pcs`` exactly: NULL
+        for every other kind, ``json.dumps`` for the same reason.
+        """
+        if kind not in KINDS:
+            # The column is free text, so the database would store a misspelt
+            # kind and the worker would fail it minutes later. Refused here,
+            # before the row exists.
+            raise ValueError(f"unknown job kind {kind!r}; expected one of {KINDS}")
+        if kind == TD and target != JETSON:
+            # A td job runs only on the Jetson worker; the cluster has no
+            # time-domain solver. Refused before the row exists, so no later
+            # path has to rescue a td row created on the wrong queue. (pc rows
+            # are not refused here: tests/pc_routing_check.py builds a cluster
+            # pc row on purpose to prove next_queued cannot see one.)
+            raise ValueError(f"a td job runs on the Jetson only; target "
+                             f"{target!r} is not {JETSON!r}")
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO mse.jobs "
+                "(job_id, original_filename, units, n_index, n_modes, status, stage, "
+                " target, est_tets, min_feature_m, min_feature_value, "
+                " min_feature_unit, scale, gpu_queued_at, materials, kind, pcs, tds) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "        CASE WHEN %s = 'jetson' THEN now() END, %s, %s, %s, %s)",
+                (str(job_id), original_filename, units, float(n_index),
+                 int(n_modes), QUEUED, QUEUED, target,
+                 None if est_tets is None else int(est_tets),
+                 None if min_feature_m is None else float(min_feature_m),
+                 None if min_feature_value is None else float(min_feature_value),
+                 min_feature_unit,
+                 float(1.0 if scale is None else scale),
+                 target,
+                 None if materials is None else json.dumps(materials),
+                 kind,
+                 None if pcs is None else json.dumps(pcs),
+                 None if tds is None else json.dumps(tds)),
+            )
+
+    def mark_failed(self, job_id, message: str) -> None:
+        """Mark a row FAILED for good. TERMINAL, and it CLEARS THE LEASE.
+
+        The lease clear is not tidiness -- it is what stops a worker solving a
+        dead job. A Jetson worker holds a lease renewed by a heartbeat, and the
+        heartbeat treats a 409 as "the lease is gone, stop". While this statement
+        left ``lease_owner`` set, the worker's ``/progress`` kept renewing against
+        a row the app had already failed, so the worker had no way to learn the
+        job was over: on the second dispatch deploy it kept solving a failed job
+        of 487,953 elements for minutes and only found out when its upload was
+        refused. Clearing the lease here turns the next heartbeat into the 409
+        that stops it, which is the mechanism already built for exactly this.
+
+        EVERY terminal path must do this, not just the worker's own ``/failed``
+        route (``fail_jetson``, which also clears it). The app can end a job on
+        its own initiative -- a launch that failed, a reaper that found the solve
+        dead -- and those rows can still carry a lease from a worker that took
+        the job before the app's verdict landed.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                "finished_at = now(), lease_owner = NULL, "
+                "lease_expires_at = NULL WHERE job_id = %s",
+                (FAILED, FAILED, message, str(job_id)),
+            )
+
+    def mark_running(self, job_id, k8s_job_name: str) -> None:
+        """Claim a queued job for the Job we just created."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, k8s_job_name = %s "
+                "WHERE job_id = %s",
+                (RUNNING, "meshing", k8s_job_name, str(job_id)),
+            )
+
+    def reroute_to_cluster(self, job_id, reason: str) -> bool:
+        """Move a jetson job back to the cluster queue. Returns whether it moved.
+
+        This is the fallback for a GPU that never came: the job's estimate put it
+        on the jetson queue, no worker claimed it inside ``MSE_GPU_WAIT_S`` (or a
+        worker claimed it and died), and the cluster can still solve it. It is
+        the same job, so nothing is re-uploaded -- only ``target`` changes and
+        the queue position resets, which is honest: it is genuinely queued again.
+
+        Guarded on ``target = 'jetson'`` so two ticks racing cannot reroute (and
+        re-log) the same job twice, and so a job a worker is *actively* holding
+        cannot be yanked out from under it. Returns False when nothing moved,
+        which is not an error: it means someone else got there first.
+
+        Also guarded on ``kind = 'cavity'``, and that guard is load-bearing.
+        The cluster launcher builds exactly one Job shape -- the cavity solver
+        -- so a pc row moved to the cluster would be cavity-solved, its band
+        diagram never produced, and (because ``next_queued`` skips pc rows and
+        ``claim_jetson`` only sees ``target = 'jetson'``) the row would be
+        invisible to BOTH queues: stranded, with no error anywhere. There is no
+        cluster pc path in this change, so a pc row STAYS on the GPU queue,
+        where its worker may still come. The guard is in the SQL, not only in
+        the caller, so no caller can strand one.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET target = %s, stage = %s, message = %s, "
+                "lease_owner = NULL, lease_expires_at = NULL, gpu_queued_at = NULL "
+                "WHERE job_id = %s AND target = %s AND status = %s AND kind = %s",
+                (CLUSTER, QUEUED, reason, str(job_id), JETSON, QUEUED, CAVITY),
+            )
+            return cur.rowcount > 0
+
+    def reclaim_expired_leases(self) -> list[str]:
+        """Expire leases past their deadline. Returns the job ids reclaimed.
+
+        An expired lease means the worker died: it renews on every progress
+        call, so a lease that ran out with no renewal has no live owner. The
+        lease is cleared AND the row is put back to ``queued``, which is what
+        makes it claimable again -- another worker takes it, and if none does
+        the ``MSE_GPU_WAIT_S`` fallback reroutes it to the cluster.
+
+        The status reset is load-bearing and was missing. ``claim_jetson``
+        requires ``status = 'queued' AND lease_owner IS NULL``, so clearing the
+        lease alone leaves the row ``running`` and NO worker can claim it. The
+        job is then stranded rather than looping: nothing errors, nothing
+        retries, it simply never moves again. A comment here used to call
+        leaving it ``running`` deliberate ("the job genuinely is mid-flight");
+        that was wrong, because the row is mid-flight only while somebody holds
+        it, and an expired lease means nobody does.
+
+        THIS COUNTS AS A RELEASE, and that is the whole reason the count is not
+        confined to the ``/release`` route. A worker that crashes mid-job every
+        time never calls ``/release`` -- it dies -- so if only that route
+        incremented the counter, a crash-looping worker would requeue through
+        lease timeouts forever and never reach the bound. Past the bound the job
+        is failed here instead, which is the only way a crash loop terminates.
+        This is the ONLY path that bounds a crash-looping worker, so the bound
+        must be reachable exactly when it is needed.
+
+        ONE STATEMENT per branch, with the bound in the WHERE, for the same
+        reason as ``release_jetson``: a racer that checks the count first can
+        requeue a job that should have failed.
+
+        **Two statements, deliberately, and the order is the fix.** The requeue
+        carries no list parameter, so nothing in it can hit a type-adaptation
+        error; the terminal update names its jobs with ``= ANY(%s::uuid[])``.
+        An earlier version did the terminal update with a plain ``ANY(%s)`` over
+        a ``list[str]``, which psycopg2 adapts as ``text[]`` -- there is no
+        ``uuid = text`` operator, so the statement raised, and the job whose
+        lease expired AT the bound stayed ``running`` with an expired lease
+        forever. Both safety nets (``reroute_to_cluster`` and
+        ``_reroute_abandoned_gpu_jobs``) require ``status = 'queued'``, so
+        neither could fire, and the bound became unreachable precisely when it
+        was needed. The cast is the fix; the SPLIT is what keeps a failure in
+        one branch from masking the other, since ``autocommit`` is on and each
+        statement stands alone.
+
+        The split is also a REPORTING fix, and that is the mechanism to hold on
+        to: because each statement commits on its own, a raise in the terminal
+        update never rolled back a requeue -- but it did make this method raise
+        out to a caller that swallowed it, so rows that HAD moved were reported
+        as none. The defect is the tick under-reporting its own work, not lost
+        data. A caller that returns ``[]`` while rows moved is
+        *could-not-ask looking like nothing-there*.
+
+        **``status = running`` on BOTH statements, and that is the second fix.**
+        A lease is only meaningful while a worker holds the row, so a row that
+        is ALREADY terminal has no business being judged on its lease at all --
+        yet the predicate here was the lease alone. That resurrected real jobs
+        in production: the reaper failed a Jetson job during a deploy while the
+        OLD ``mark_failed`` left its lease dangling, and this method then found
+        the expired lease, requeued the row to ``queued``, and a worker claimed
+        and solved a job the owner had been told was FAILED. Measured on the 3rd
+        deploy (20:15Z, job 375964fe): the web log read "its GPU worker's lease
+        expired; the job is claimable again".
+
+        The filter belongs on the OVER-BOUND statement too, for the same reason
+        and one more: without it, a terminal row with a legacy dangling lease
+        and a high ``release_count`` would be "failed" a second time, stamping a
+        fresh ``finished_at`` and a retries message on a job that finished hours
+        ago.
+
+        This is belt-and-braces with ``mark_failed`` clearing the lease. That
+        fix stops NEW terminal rows from holding one; this filter means a row
+        that is terminal for ANY reason -- legacy data, or a future path that
+        forgets to clear -- is not resurrected. ``clear_terminal_leases``
+        retires the legacy rows at startup.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            # (a) Requeue everything under the bound. No list parameter here, so
+            # this branch cannot fail on type adaptation.
+            # ``message`` is set in the same statement here, unlike
+            # ``release_jetson``, because the attempt number comes back from
+            # this UPDATE's own RETURNING -- so the text is per-row and correct
+            # without a second statement per job. The reason is fixed rather
+            # than a caller's: an expired lease says only that the worker
+            # stopped, which is exactly what the owner needs to know.
+            # The message is written for ALL reclaimed rows at once, so it
+            # cannot name a per-row attempt number in this statement -- the
+            # number is only known after the increment. It states the reason and
+            # the bound without the count, which is the honest form: "retrying
+            # (of up to 3)". Naming a specific attempt here would mean a second
+            # statement per row, and the reason is what the owner needs.
+            cur.execute(
+                "UPDATE mse.jobs SET lease_owner = NULL, "
+                "lease_expires_at = NULL, status = %s, stage = %s, "
+                "gpu_queued_at = now(), message = %s, "
+                "release_count = release_count + 1, "
+                "busy_since = NULL, busy_until = NULL "
+                "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
+                "AND status = %s "
+                "AND release_count < %s "
+                "RETURNING job_id",
+                (QUEUED, "queued",
+                 _retry_message("the GPU worker stopped responding",
+                                MAX_RELEASES),
+                 RUNNING, MAX_RELEASES),
+            )
+            requeued = [str(r[0]) for r in cur.fetchall()]
+
+            # (b) Fail whatever is still expired and AT the bound. ``::uuid[]``
+            # is required: the column is ``uuid`` and psycopg2 adapts a
+            # ``list[str]`` as ``text[]``, which has no ``= uuid`` operator.
+            cur.execute(
+                "SELECT job_id FROM mse.jobs "
+                "WHERE lease_owner IS NOT NULL AND lease_expires_at < now() "
+                "AND status = %s "
+                "AND release_count >= %s",
+                (RUNNING, MAX_RELEASES),
+            )
+            over = [str(r[0]) for r in cur.fetchall()]
+            if over:
+                cur.execute(
+                    "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                    "finished_at = now(), lease_owner = NULL, "
+                    "lease_expires_at = NULL "
+                    "WHERE job_id = ANY(%s::uuid[]) AND lease_owner IS NOT NULL "
+                    "AND status = %s "
+                    "AND lease_expires_at < now()",
+                    (FAILED, FAILED,
+                     "the GPU worker stopped responding and the job was "
+                     f"retried up to {MAX_RELEASES} times; try again later",
+                     over, RUNNING),
+                )
+
+        # What actually moved, read back from the requeue's own RETURNING rather
+        # than reconstructed from the pre-read. The pre-read and the UPDATE are
+        # separate statements under autocommit, so a row that another tick
+        # reclaimed in between would be reported as ours. A job that was just
+        # FAILED is terminal and deliberately not reported: telling the caller to
+        # go looking for a worker would send it after one that does not exist.
+        return requeued
+
+    def set_k8s_job_name(self, job_id, k8s_job_name: str) -> None:
+        """Record the Job name even if the Job could not be created."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET k8s_job_name = %s WHERE job_id = %s",
+                (k8s_job_name, str(job_id)),
+            )
+
+    # -- reads -------------------------------------------------------------
+    def get_job(self, job_id) -> dict | None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, created_at, original_filename, units, n_index, "
+                "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
+                "finished_at, target, est_tets, min_feature_m, scale, "
+                "min_feature_value, min_feature_unit, materials, kind, pcs, tds "
+                "FROM mse.jobs WHERE job_id = %s",
+                (str(job_id),),
+            )
+            row = cur.fetchone()
+        return _job_row(row) if row else None
+
+    def list_jobs(self, limit: int = 25) -> list[dict]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, created_at, original_filename, units, n_index, "
+                "n_modes, status, stage, message, k8s_job_name, peak_rss_mb, "
+                "finished_at, target, est_tets, min_feature_m, scale, "
+                "min_feature_value, min_feature_unit, materials, kind, pcs, tds "
+                "FROM mse.jobs ORDER BY created_at DESC LIMIT %s",
+                (int(limit),),
+            )
+            rows = cur.fetchall()
+        return [_job_row(r) for r in rows]
+
+    def list_modes(self, job_id) -> list[dict]:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT mode_index, k0_per_m, freq_hz, vacuum_wavelength_m "
+                "FROM mse.modes WHERE job_id = %s ORDER BY mode_index",
+                (str(job_id),),
+            )
+            rows = cur.fetchall()
+        return [
+            {"index": int(r[0]), "k0_per_m": r[1], "freq_hz": r[2],
+             "vacuum_wavelength_m": r[3]}
+            for r in rows
+        ]
+
+    # -- the queue ---------------------------------------------------------
+    def next_queued(self, targets=CLUSTER_TARGETS) -> dict | None:
+        """Oldest upload still waiting for the Job slot on any of ``targets``.
+
+        Defaults to every target that IS a k8s Job here, so a ``cluster-gpu``
+        row is picked up by the same slot as a ``cluster`` one. That is
+        deliberate: the namespace admits exactly one ``batch/v1`` Job including
+        finished ones, so the two Job targets share the slot rather than each
+        getting one.
+
+        Filtered by target: a jetson row reaching the launcher would occupy that
+        slot while the app waited for a GPU worker that is not coming. Jetson
+        rows are claimed by the worker API instead -- see ``claim_jetson``.
+
+        Filtered by kind as well, and this is not belt-and-braces. The cluster
+        has no pc or td solver: ``launcher.create`` refuses any kind but cavity,
+        so a ``kind='pc'`` or ``'td'`` row reaching here would be failed at
+        launch instead of waiting for the Jetson. The kind filter is what makes
+        the cluster queue unable to see such a row at all, independent of which
+        target the row carries. It is a WHITELIST (``kind = 'cavity'``), so a
+        kind added later is invisible here until a cluster solver exists for it.
+        """
+        if isinstance(targets, str):
+            targets = (targets,)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, original_filename, units, n_index, n_modes, est_tets, "
+                "min_feature_m, scale, materials, kind, target "
+                "FROM mse.jobs WHERE status = %s AND target = ANY(%s) AND kind = %s "
+                "ORDER BY created_at LIMIT 1",
+                (QUEUED, list(targets), CAVITY),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {"job_id": str(row[0]), "original_filename": row[1],
+                "units": row[2], "n_index": row[3], "n_modes": row[4],
+                "est_tets": row[5], "min_feature_m": row[6], "scale": row[7],
+                "materials": row[8], "kind": row[9], "target": row[10]}
+
+    def jetson_waiting(self, older_than_seconds: float) -> list[dict]:
+        """Jetson rows nobody has claimed for longer than the wait window.
+
+        ``gpu_queued_at`` is the clock, not ``created_at``: a job that was tried
+        on the cluster and rerouted has an old ``created_at`` but has only just
+        become a GPU candidate, and counting from ``created_at`` would reroute it
+        back to the cluster immediately.
+
+        ``lease_owner IS NULL`` excludes the row a worker is actively holding --
+        a slow solve is not an abandoned one, and pulling a live job's row out
+        from under it would duplicate the work it is already doing.
+
+        ``kind`` is carried so the caller can tell a pc row from a cavity one:
+        the reroute path must not move a pc row to the cluster, and the caller
+        decides that, not this listing.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, est_tets, kind FROM mse.jobs "
+                "WHERE target = %s AND status = %s AND lease_owner IS NULL "
+                "AND gpu_queued_at IS NOT NULL "
+                "AND gpu_queued_at < now() - make_interval(secs => %s) "
+                "ORDER BY gpu_queued_at",
+                (JETSON, QUEUED, float(older_than_seconds)),
+            )
+            return [{"job_id": str(r[0]), "est_tets": r[1], "kind": r[2]}
+                    for r in cur.fetchall()]
+
+    def claim_jetson(self, owner: str, lease_seconds: float) -> dict | None:
+        """Atomically take the oldest unclaimed jetson job for ``owner``.
+
+        ``FOR UPDATE SKIP LOCKED`` is the whole point: two workers polling at the
+        same instant must get *different* jobs or no job, never the same one. A
+        plain ``SELECT`` followed by an ``UPDATE`` would let both read the same
+        row and both start solving it -- the classic double-claim, and it would
+        only show up as two workers fighting over one job's output files.
+
+        Returns ``None`` when there is nothing to claim, which is the normal
+        case (204), not an error.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id, units, n_index, n_modes, min_feature_m, scale, materials, "
+                "kind, pcs, tds "
+                "FROM mse.jobs "
+                "WHERE target = %s AND status = %s AND lease_owner IS NULL "
+                # A td job the worker just deferred as "Jetson busy" sits out
+                # until ``busy_until``, or the same worker would claim it again
+                # at once and spin. Every other row has busy_until NULL.
+                "AND (busy_until IS NULL OR busy_until <= now()) "
+                "ORDER BY created_at "
+                "FOR UPDATE SKIP LOCKED LIMIT 1",
+                (JETSON, QUEUED),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            job_id = str(row[0])
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, k8s_job_name = NULL, "
+                "lease_owner = %s, "
+                "lease_expires_at = now() + make_interval(secs => %s) "
+                "WHERE job_id = %s",
+                (RUNNING, "queued", owner, float(lease_seconds), job_id),
+            )
+        return {"job_id": job_id, "units": row[1], "n_index": row[2],
+                "n_modes": row[3], "min_feature_m": row[4], "scale": row[5],
+                "lease_owner": owner, "materials": row[6], "kind": row[7],
+                "pcs": row[8], "tds": row[9]}
+
+    def renew_lease(self, job_id, owner: str, lease_seconds: float) -> bool:
+        """Extend ``owner``'s lease. Returns whether it still holds it.
+
+        Guarded on ``lease_owner = owner``, so a worker whose lease expired and
+        was taken by someone else cannot renew its way back in -- it gets False
+        and must stop writing. This is the only defence against two workers
+        writing one job's files after a network partition.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET lease_expires_at = "
+                "now() + make_interval(secs => %s) "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (float(lease_seconds), str(job_id), owner),
+            )
+            return cur.rowcount > 0
+
+    def set_jetson_stage(self, job_id, stage: str) -> None:
+        """Record a worker-reported stage on a jetson job.
+
+        Deliberately unguarded on the lease: this is a progress label, not a
+        result. A worker that lost its lease mid-solve writing a stale stage
+        costs the owner a slightly wrong word on a page that is about to be
+        rewritten by the winner; refusing it would cost nothing but would put a
+        lease check on the heartbeat path, where a false negative stops a live
+        solve.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET stage = %s, status = %s "
+                "WHERE job_id = %s AND target = %s",
+                (stage, RUNNING, str(job_id), JETSON),
+            )
+
+    def finish_jetson(self, job_id, owner: str) -> bool:
+        """Mark a jetson job done, if ``owner`` still holds the lease.
+
+        Returns whether it moved. The caller has already checked the lease, but
+        this checks again inside the same statement: between the check and the
+        write, a lease can expire and another worker can take the job -- and the
+        loser must not be the one that marks it done.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, finished_at = now(), "
+                "lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (DONE, DONE, str(job_id), owner),
+            )
+            return cur.rowcount > 0
+
+    def finish_jetson_with_modes(self, job_id, owner: str, rows) -> bool:
+        """Mark a jetson job done AND write its mode rows, in ONE transaction.
+
+        This is what ``/done`` uses. ``finish_jetson`` remains for the cluster
+        path and for the tests that predate this method, but the Jetson route
+        may not use it: marking the job DONE without writing ``mse.modes`` is
+        exactly the deploy-3 shape, where the app reports a finished job whose
+        mode list is empty -- a failure that reads as a successful job with no
+        modes rather than as a job that did not report them.
+
+        ``rows`` are ``(index, k0_per_m, freq_hz, vacuum_wavelength_m)``
+        four-tuples, already validated by the route.
+
+        Returns whether it wrote. ``False`` means the lease went between the
+        route's check and this statement, and then NOTHING was written: the
+        status update, the DELETE and the INSERT are one unit, so a lost lease
+        cannot leave a job with its modes deleted.
+
+        **Why this opens its own connection.** Not because ``autocommit = True``
+        would break the rollback -- measured on Postgres 16, and it does not:
+        psycopg2's ``with conn`` is a TRANSACTION context manager that issues
+        ``BEGIN`` on entry and ``ROLLBACK`` on an exception *regardless* of the
+        autocommit flag, so ``_connect()`` plus ``with conn`` would also be
+        atomic. The transaction here comes from ``with conn``; pinning the
+        connection to ``autocommit = False`` states that intent on the connection
+        itself rather than resting it on a protocol detail of the driver.
+
+        The shape that genuinely loses data -- and the one the probe in the
+        commit message demonstrates -- is autocommit with NO ``with conn``: the
+        DELETE commits the instant it runs, and a later failure leaves the job
+        with its modes gone and nothing written. Do not "simplify" the
+        ``with conn`` away; it is the transaction.
+        """
+        conn = self._open(autocommit=False)
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE mse.jobs SET status = %s, stage = %s, finished_at = now(), "
+                    "lease_owner = NULL, lease_expires_at = NULL "
+                    "WHERE job_id = %s AND lease_owner = %s",
+                    (DONE, DONE, str(job_id), owner),
+                )
+                if cur.rowcount == 0:
+                    # The lease went between the route's check and this write.
+                    # ``rollback`` explicitly rather than falling out of the
+                    # ``with``: on the clean path the ``with`` COMMITS, and a
+                    # bare ``return False`` would commit the empty transaction
+                    # -- harmless today, but it is the wrong reflex to leave in
+                    # a method whose whole point is that nothing is written when
+                    # the lease is gone.
+                    conn.rollback()
+                    return False
+                cur.execute("DELETE FROM mse.modes WHERE job_id = %s", (str(job_id),))
+                cur.executemany(
+                    "INSERT INTO mse.modes "
+                    "(job_id, mode_index, k0_per_m, freq_hz, vacuum_wavelength_m) "
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT (job_id, mode_index) DO UPDATE SET "
+                    "k0_per_m = EXCLUDED.k0_per_m, freq_hz = EXCLUDED.freq_hz, "
+                    "vacuum_wavelength_m = EXCLUDED.vacuum_wavelength_m",
+                    [(str(job_id), int(i), float(k0), float(f), float(wl))
+                     for (i, k0, f, wl) in rows],
+                )
+        finally:
+            conn.close()
+        return True
+
+    def finish_jetson_with_bands(self, job_id, owner: str, request: dict,
+                                 bands: dict) -> bool:
+        """Mark a pc job done AND write its band diagram, in ONE transaction.
+
+        The pc counterpart to :meth:`finish_jetson_with_modes`, and the same
+        argument applies to why it is one statement-unit: marking the job DONE
+        while the diagram is absent is the deploy-3 shape, where a finished job
+        displays as an empty panel rather than as a job that did not report.
+
+        **The bands are MERGED into the existing ``pcs``, not written over it.**
+        The column already holds the REQUEST (``web/pc_form.request_json`` writes
+        exactly the seven request keys) and §5 says the same column holds the
+        request *and* the computed bands. Writing only ``bands`` would drop the
+        request, and writing ``request | bands`` from the route's copy would race
+        a second claim; the merge is done in SQL against the row's current value
+        with ``||``, so the request that was solved is the request that stays.
+
+        ``request`` is passed but not stored: it is the route's proof of what it
+        validated, and keeping the parameter means a future caller cannot write
+        bands for a request the row does not hold. It is compared in the route,
+        not here -- this method's job is the one atomic write.
+
+        Returns whether it wrote. ``False`` means the lease went between the
+        route's check and this statement, and then NOTHING is written: the
+        status update and the jsonb merge are one unit.
+
+        The connection dance is the same as :meth:`finish_jetson_with_modes`,
+        for the same measured reason -- see that method's docstring. The
+        ``with conn`` IS the transaction; do not "simplify" it away.
+        """
+        conn = self._open(autocommit=False)
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE mse.jobs SET status = %s, stage = %s, finished_at = now(), "
+                    "pcs = coalesce(pcs, '{}'::jsonb) || %s::jsonb, "
+                    "lease_owner = NULL, lease_expires_at = NULL "
+                    "WHERE job_id = %s AND lease_owner = %s",
+                    (DONE, DONE, json.dumps({"bands": bands}), str(job_id), owner),
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    return False
+        finally:
+            conn.close()
+        return True
+
+    def fail_jetson(self, job_id, owner: str, message: str) -> bool:
+        """Mark a jetson job FAILED for good, if ``owner`` still holds the lease.
+
+        TERMINAL, and that is the point. The earlier behaviour -- releasing the
+        lease and requeueing -- meant a deterministic failure (a mesh the
+        mesher refuses, a box that is too detailed, a solver exception) came
+        straight back to the same or the next worker, which failed it the same
+        way. Forever. The message was logged and nowhere else, so the owner saw
+        a job that never finished and no reason for it.
+
+        ``finished_at`` is set and the lease cleared in the same statement, so
+        the row is in exactly the state the cluster's own failure path leaves it
+        in: the owner's job page reads it through the same column.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (FAILED, FAILED, message, str(job_id), owner),
+            )
+            return cur.rowcount > 0
+
+    def release_jetson(self, job_id, owner: str, message: str = "") -> str | None:
+        """Hand a job back with no verdict -- or FAIL it if it has been released
+        too many times. One statement, one transaction.
+
+        Returns ``"released"``, ``"failed"`` (the bound was reached and the job
+        is now terminal) or ``None`` (this owner does not hold the lease -- the
+        caller answers 409, never a silent success).
+
+        For TRANSIENT reasons only -- a SIGTERM shutdown mid-job, a CUDA init
+        failure, a lost connection. Not a verdict about the job, so the row goes
+        back to ``queued`` and another worker (or this one, later) can take it.
+
+        WHY ONE STATEMENT. The bound has to hold when two releases race. A
+        read-count-then-decide form lets both callers read ``count = 2``, both
+        conclude they are under the bound, and both requeue -- the job that
+        should have failed at 3 instead goes round again, which is exactly the
+        non-terminating loop this whole mechanism exists to remove. Putting the
+        counter in the ``UPDATE``'s WHERE clause makes the database do the
+        comparison, so a losing racer matches zero rows and takes the failure
+        branch below.
+
+        WHY THE COUNT IS ON EVERY PATH BACK TO CLAIMABLE. ``/release`` is not
+        the only way a jetson row returns to the queue: a lease EXPIRY (a worker
+        that died mid-job) requeues it too. If only ``/release`` incremented the
+        count, a worker that crashed every time would requeue forever through
+        the timeout path and never hit the bound. See ``reclaim_expired_leases``.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            # Try the bounded release first. The WHERE carries the bound, so a
+            # racer that loses sees rowcount 0 and falls through to the failure.
+            # ``message`` is written in a SECOND statement below, after this one
+            # tells us which attempt this was: the text names the attempt count
+            # and that number only exists once the increment has happened.
+            cur.execute(
+                "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "status = %s, stage = %s, gpu_queued_at = now(), "
+                "release_count = release_count + 1, "
+                "busy_since = NULL, busy_until = NULL "
+                "WHERE job_id = %s AND lease_owner = %s AND release_count < %s "
+                "RETURNING release_count",
+                (QUEUED, "queued", str(job_id), owner, MAX_RELEASES),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                cur.execute(
+                    "UPDATE mse.jobs SET message = %s WHERE job_id = %s",
+                    (_retry_message(message, MAX_RELEASES, attempt=row[0]),
+                     str(job_id)),
+                )
+                return "released"
+            # Zero rows: either the lease is not ours (409) or the bound is
+            # reached. Distinguish them, because they are not the same event.
+            cur.execute(
+                "SELECT release_count FROM mse.jobs "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (str(job_id), owner),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            # Over the bound and still ours: fail it, in this same transaction.
+            # The message is written from THIS attempt -- the failure the owner
+            # should see is the one that finally ended it, not the first one,
+            # which would name an earlier cause than the run that gave up.
+            #
+            # The branch is guarded on the same predicate the SQL uses, so the
+            # two cannot drift: a row that reaches here with ``row[0]`` under the
+            # bound means the UPDATE above matched nothing for some OTHER reason,
+            # and failing the job on that would be the instrument deciding the
+            # verdict. It cannot happen at READ COMMITTED (the row lock makes the
+            # second statement see the first's result), so it is a guard rather
+            # than a path -- but a guard that cannot refuse is not a guard.
+            if not releases_are_terminal(row[0]):
+                return None
+            # The bound sentence is APPENDED to the caller's message, not
+            # substituted for it. The old form was ``message or <bound
+            # sentence>``, which read as though the sentence were a fallback --
+            # but the worker always supplies a message, so the sentence was
+            # never reached and the owner was never told that the job had
+            # already been retried to its limit. They would see "the GPU worker
+            # stopped responding" with no way to know a further attempt was not
+            # coming.
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (FAILED, FAILED,
+                 _terminal_message(message, row[0]),
+                 str(job_id), owner),
+            )
+            return "failed"
+
+    def defer_busy(self, job_id, owner: str, message: str = "") -> str | None:
+        """Put a td job back in the queue because the Jetson is short of memory.
+
+        Returns ``"deferred"``, ``"failed"`` (it has waited ``BUSY_WAIT_MINUTES``
+        since its first deferral) or ``None`` (not this owner's lease, or not a
+        td job -- the caller answers 409).
+
+        NOT a release. A busy Jetson says nothing about the job, so
+        ``release_count`` is left alone: three deferrals would otherwise fail a
+        job that never ran. The bound here is the wall-clock wait instead,
+        measured from ``busy_since``, which the first deferral sets and later
+        ones keep. ``busy_until`` holds the job out of the claim query for
+        ``BUSY_RETRY_SECONDS``, so the worker that just deferred it does not
+        claim it straight back. ``target`` is not touched: a td job stays on the
+        Jetson queue, the only place it can run.
+
+        One statement for the deferral, with the bound in its WHERE, for the
+        reason ``release_jetson`` is one: the database makes the comparison, so
+        a deferral after the deadline matches nothing and takes the failure
+        branch.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE mse.jobs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "status = %s, stage = %s, message = %s, "
+                "busy_since = COALESCE(busy_since, now()), "
+                "busy_until = now() + make_interval(secs => %s) "
+                "WHERE job_id = %s AND lease_owner = %s AND kind = %s "
+                "AND (busy_since IS NULL "
+                "     OR busy_since > now() - make_interval(mins => %s)) "
+                "RETURNING busy_since",
+                (QUEUED, BUSY_STAGE, _busy_message(message),
+                 float(BUSY_RETRY_SECONDS), str(job_id), owner, TD,
+                 int(BUSY_WAIT_MINUTES)),
+            )
+            if cur.fetchone() is not None:
+                return "deferred"
+            # Zero rows: not ours, not td, or past the wait. Only the last fails.
+            cur.execute(
+                "SELECT busy_since <= now() - make_interval(mins => %s) "
+                "FROM mse.jobs WHERE job_id = %s AND lease_owner = %s "
+                "AND kind = %s",
+                (int(BUSY_WAIT_MINUTES), str(job_id), owner, TD),
+            )
+            row = cur.fetchone()
+            if row is None or not row[0]:
+                return None
+            cur.execute(
+                "UPDATE mse.jobs SET status = %s, stage = %s, message = %s, "
+                "finished_at = now(), lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE job_id = %s AND lease_owner = %s",
+                (FAILED, FAILED, BUSY_GAVE_UP_MESSAGE, str(job_id), owner),
+            )
+            return "failed"
+
+    def lease_held_by(self, job_id, owner: str) -> bool:
+        """Whether ``owner`` currently holds ``job_id``'s lease and it is live.
+
+        Every worker write goes through this. Two separate conditions, and both
+        matter: the owner must match (a stale worker must not write) and the
+        lease must not have expired (a worker that vanished and came back must
+        not write either). Checking only the owner would let a worker that slept
+        through its lease resume writing over its successor's output.
+
+        **A TERMINAL row is never held, and that is the THIRD condition.** It is
+        the same bug as ``reclaim_expired_leases``' missing status filter, at the
+        other door: a row left terminal-but-leased by the old ``mark_failed``
+        satisfies both conditions above, so this returned True and ``_held``
+        waved a worker through to write progress and results onto a job the
+        owner had already been told was over. The two predicates must agree --
+        if reclaim refuses to requeue a terminal row, the worker gate must
+        refuse to serve it.
+
+        ``status = running`` rather than ``status <> 'failed' AND status <>
+        'done'`` so the shipped ``FINISHED`` tuple stays the single statement of
+        what terminal means; a third terminal state would otherwise be a fresh
+        hole here. A row that is ``queued`` cannot pass anyway, because queued
+        rows carry no lease.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM mse.jobs WHERE job_id = %s AND lease_owner = %s "
+                "AND lease_expires_at > now() AND status = %s",
+                (str(job_id), owner, RUNNING),
+            )
+            return cur.fetchone() is not None
+
+    def queue_position(self, job_id) -> int | None:
+        """1-based place in the queue, or None once the job is no longer queued."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT created_at, status FROM mse.jobs WHERE job_id = %s",
+                        (str(job_id),))
+            row = cur.fetchone()
+            if not row or row[1] != QUEUED:
+                return None
+            cur.execute(
+                "SELECT count(*) FROM mse.jobs WHERE status = %s AND created_at < %s",
+                (QUEUED, row[0]),
+            )
+            ahead = int(cur.fetchone()[0])
+        return ahead + 1
+
+    def count_running(self) -> int:
+        """Jobs the app believes are running (belt and braces; the Job list is
+        the authority)."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM mse.jobs WHERE status = %s", (RUNNING,))
+            return int(cur.fetchone()[0])
+
+    # NOTE: there is deliberately no `requeue_stale` here any more. It put rows
+    # whose Job had vanished back into `queued`, which sounds self-healing but
+    # re-runs a solve that has already died -- an object that OOMs would OOM on
+    # every attempt, forever. A row that is `running` with no Job behind it did
+    # not finish, so the tick now fails it (see app._fail_dead_jobs) and the
+    # owner is told, rather than watching a spinner that never ends.
+
+
+def _job_row(row) -> dict:
+    return {
+        "job_id": str(row[0]),
+        "created_at": _iso(row[1]),
+        "original_filename": row[2],
+        "units": row[3],
+        "n_index": row[4],
+        "n_modes": row[5],
+        "status": row[6],
+        "stage": row[7],
+        "message": row[8],
+        "k8s_job_name": row[9],
+        "peak_rss_mb": row[10],
+        "finished_at": _iso(row[11]),
+        "target": row[12],
+        "est_tets": row[13],
+        "min_feature_m": row[14],
+        "scale": row[15],
+        "min_feature_value": row[16],
+        "min_feature_unit": row[17],
+        # A jsonb column comes back as a dict, or as None for the one-part
+        # vacuum uploads. The two are left DISTINCT on purpose: None is "no
+        # materials table", {} would be "a table with no parts", and a page or
+        # a solver that collapsed them could not tell an old job from a
+        # malformed new one. Row values are passed through as read rather than
+        # normalised, for the same reason.
+        "materials": row[18],
+        # The job's ROUTE and, for a pc job, the request being solved. Selected
+        # here rather than by a second query because the ``/done`` route has to
+        # branch on ``kind`` and every reader of a job (the status payload, the
+        # job page) needs the same field to pick a view. Added after
+        # ``materials`` for the same additive reason the column was.
+        "kind": row[19],
+        "pcs": row[20],
+        "tds": row[21],
+    }
+
+
+def _iso(value) -> str | None:
+    """timestamptz -> ISO 8601 in UTC, so the browser can localise it."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    return str(value)

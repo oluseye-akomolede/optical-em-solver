@@ -1,0 +1,525 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h1>Upload an object</h1>
+  <p class="muted">
+    Send a closed (<em>watertight</em>) <strong>.obj</strong> model. We treat it as a
+    hollow metal cavity and compute its lowest optical modes.
+  </p>
+  <p class="muted small">
+    One thing to know before you trust a number: the walls are modelled as a
+    <em>perfect conductor</em>. That is an excellent approximation for a real metal at
+    microwave frequencies and a rough one at optical frequencies, where the field
+    penetrates the metal and the true resonance shifts. Treat these frequencies as the
+    ideal-cavity answer, not a measured one.
+  </p>
+  {# The mode selector. Each `.mode-detail` fieldset names the modes it belongs
+     to in `data-modes`; the script at the bottom of this file shows exactly
+     those and keeps the `required` attributes in step with what is visible -- a
+     hidden file input that stays `required` blocks submission with a browser
+     message pointing at a control the owner cannot see, which is the
+     could-not-ask shape in a form. Only controls marked `data-required` are
+     ever made required: the optional ones (scale, feature size) stay optional
+     whichever arm is showing. #}
+  <form method="post" enctype="multipart/form-data" class="upload" id="upload-form">
+    <div class="row">
+      <label>What would you like to compute?
+        <select name="mode" id="mode-select">
+          <option value="cavity" selected>Optical modes of an object (3-D)</option>
+          <option value="pc">Band diagram of a 2-D photonic crystal</option>
+          <option value="td">Light moving through an object over time (3-D)</option>
+        </select>
+      </label>
+    </div>
+
+    {# The upload itself, shared by the two arms that take an object. #}
+    <fieldset id="detail-object" class="mode-detail" data-modes="cavity td">
+    <label>Model file (.obj, up to {{ max_mb }} MB)
+      <input type="file" name="meshfile" accept=".obj" data-required>
+    </label>
+    <div class="row">
+      <label>Units
+        <select name="units" data-required>
+          {% for unit in units %}
+            <option value="{{ unit }}" {% if unit == default_units %}selected{% endif %}>{{ unit }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Scale factor &mdash; optional
+        <input type="text" name="scale" value="" placeholder="1"
+               pattern="[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?">
+      </label>
+    </div>
+    <p class="muted small">
+      The <strong>scale factor</strong> multiplies the model before anything else looks
+      at it, so <code>1000</code> turns a model drawn in millimetres into one 1000 times
+      larger. Leave it blank for the model exactly as it is. If your .obj has no stated
+      units, this is how you say how big it really is &mdash; and the size you state is
+      the size whose modes you get.
+    </p>
+    </fieldset>
+
+    <fieldset id="detail-cavity" class="mode-detail" data-modes="cavity">
+    <div class="row">
+      <label>Refractive index
+        <input type="number" name="n_index" value="1.0" min="1" step="0.001" data-required>
+      </label>
+      <label>Modes
+        <select name="n_modes" data-required>
+          {% for count in mode_choices %}
+            <option value="{{ count }}" {% if count == default_n_modes %}selected{% endif %}>{{ count }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+    <p class="muted small">
+      The refractive index is the medium filling your object: 1.0 for air or vacuum,
+      about 1.5 for glass. More modes means a finer mesh and a longer solve; the
+      mesh grows in proportion to this number.
+    </p>
+    <div class="row">
+      <label>Smallest feature &mdash; optional
+        <input type="text" name="detail" value="auto" placeholder="auto"
+               pattern="auto|([0-9]*\.?[0-9]+)">
+        <select name="feature_unit" aria-label="Smallest feature units">
+          {% for unit in feature_unit_choices %}
+          <option value="{{ unit }}"{% if unit == default_feature_unit %} selected{% endif %}>{{ unit }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+    <p class="muted small">
+      Leave the feature size on <strong>auto</strong> for the default resolution, which
+      is set by the physics of the modes you asked for. If your object has fine detail
+      the modes depend on &mdash; a thin wall, a narrow gap &mdash; enter its size and
+      pick its unit from the menu beside it. The feature's unit is its own and is
+      <strong>independent of the units you uploaded your object in</strong>: <code>0.2
+      mm</code> means two hundred microns whether your .obj is in metres or in
+      millimetres. Setting it larger than the automatic value has no effect: the mesh is
+      never made coarser than the detail you name.
+    </p>
+    </fieldset>
+
+    {# The photonic-crystal arm. No file: the request is the geometry of the
+       unit cell and the two indices. Every field here is dimensionless, which
+       is why there is no unit menu and no scale factor -- ω comes back in units
+       of a/(2πc) and the lattice constant never needs a number. #}
+    <fieldset id="detail-pc" class="mode-detail" data-modes="pc" hidden>
+      <p class="muted small">
+        A 2-D photonic crystal: a square or triangular lattice of rods in a
+        background, solved on the high-symmetry path through the Brillouin
+        zone. The result is a band diagram &mdash; frequency against k &mdash;
+        with any band gaps shaded and their midgap ratios printed. Everything
+        here is a fraction of the lattice constant <code>a</code>, so nothing is
+        stated in metres.
+      </p>
+      <div class="row">
+        <label>Lattice
+          <select name="lattice" data-required>
+            {% for lattice in lattices %}
+              <option value="{{ lattice }}"{% if lattice == 'square' %} selected{% endif %}>{{ lattice }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Rod radius (as a fraction of a)
+          <input type="number" name="r_over_a" value="0.2" min="0.001" max="0.499"
+                 step="0.001" data-required>
+        </label>
+        <label>Polarisation
+          <select name="polarisation" data-required>
+            {% for pol in polarisations %}
+              <option value="{{ pol }}"{% if pol == 'TM' %} selected{% endif %}>{{ pol }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Rod refractive index
+          <input type="number" name="n_rod" value="3.5" min="0.001" step="0.001" data-required>
+        </label>
+        <label>Background refractive index
+          <input type="number" name="n_bg" value="1.0" min="0.001" step="0.001" data-required>
+        </label>
+        <label>Bands (per polarisation)
+          <input type="number" name="n_bands" value="6" min="1" max="{{ max_bands }}"
+                 step="1" data-required>
+        </label>
+        <label>Divisions per cell edge
+          <input type="number" name="divisions" value="24" min="4"
+                 max="{{ max_divisions }}" step="1" data-required>
+        </label>
+      </div>
+      <p class="muted small">
+        <strong>TM</strong> is the field out of the plane (E<sub>z</sub>) and
+        <strong>TE</strong> is its magnetic counterpart (H<sub>z</sub>) &mdash;
+        they are two different problems and are solved separately. More
+        divisions means a finer cell and a longer solve; more bands means a
+        larger eigenvalue problem. The app refuses a request that would exceed
+        its node or k-point ceiling, and says which limit was hit.
+      </p>
+    </fieldset>
+
+    {# The time-domain arm. The object comes from the shared upload fieldset
+       above; this is the source, the run and the probes. Every field name here
+       is read by web/td_form.py, which refuses by name -- including the ones the
+       chosen source does not use, which are hidden by `data-when` and ignored
+       by the form. #}
+    <fieldset id="detail-td" class="mode-detail" data-modes="td" hidden>
+      <p class="muted small">
+        A time-domain run: we put your object on a grid, switch on a light
+        source, and step Maxwell's equations forward in time. The result is the
+        field recorded at each probe, its spectrum, and a short movie of the
+        field strength. Positions are measured from the <strong>lowest corner
+        of your object's bounding box</strong>, after the units and scale above,
+        in the length unit you pick here.
+      </p>
+      <div class="row">
+        <label>Outside the object
+          <select name="td_boundary" data-required>
+            <option value="open" selected>open space (waves leave)</option>
+            <option value="metal">a metal box (waves reflect)</option>
+          </select>
+        </label>
+        <label id="td-one-index">Object's refractive index
+          <input type="number" name="td_n_index" value="1.5" min="1" step="0.001" data-required>
+        </label>
+        <label>Length unit (positions, cell size)
+          <select name="td_unit" data-required>
+            {% for unit in td_units %}
+              <option value="{{ unit }}"{% if unit == 'um' %} selected{% endif %}>{{ unit }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Cell size
+          <input type="number" name="td_dx" value="0.05" min="0" step="any" data-required>
+        </label>
+      </div>
+      {# One material per part when the object has several, and an optional
+         coating for every part (filled from /parts by the script below; the
+         pickers post part_index.<name>, part_coating.<name> and
+         part_coating_thickness.<name>). #}
+      <div id="td-parts" class="row" hidden></div>
+      <p id="td-parts-note" class="muted small" hidden></p>
+      <div class="row">
+        <label>Source
+          <select name="td_source_kind" id="td-source-kind" data-required>
+            <option value="point" selected>a point (a tiny antenna)</option>
+            <option value="plane">a plane wave</option>
+          </select>
+        </label>
+        <label>Field direction
+          <select name="td_polarisation" data-required>
+            {% for pol in td_polarisations %}
+              <option value="{{ pol }}"{% if pol == 'z' %} selected{% endif %}>{{ pol }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label data-when="td_source_kind:point">Source position (x y z)
+          <input type="text" name="td_position" value="" placeholder="0.5 0.5 0.5" data-required>
+        </label>
+        <label data-when="td_source_kind:plane">Travelling towards
+          <select name="td_direction" data-required>
+            {% for d in td_directions %}
+              <option value="{{ d }}"{% if d == '+x' %} selected{% endif %}>{{ d }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Time profile
+          <select name="td_profile" id="td-profile" data-required>
+            <option value="pulse" selected>a pulse (many frequencies at once)</option>
+            <option value="cw">a steady wave (one frequency)</option>
+            <option value="drawn">my own waveform</option>
+          </select>
+        </label>
+        <label>Frequency (THz)
+          <input type="number" name="td_frequency_thz" value="300" min="0" step="any" data-required>
+        </label>
+        <label data-when="td_profile:pulse">Pulse bandwidth (THz)
+          <input type="number" name="td_bandwidth_thz" value="200" min="0" step="any" data-required>
+        </label>
+        <label>Run for (fs)
+          <input type="number" name="td_duration_fs" value="100" min="0" step="any" data-required>
+        </label>
+      </div>
+      <div class="row">
+        <label>Movie from (fs) &mdash; blank: the run's start
+          <input type="number" name="td_movie_start_fs" value="" min="0" step="any">
+        </label>
+        <label>Movie to (fs) &mdash; blank: the run's end
+          <input type="number" name="td_movie_end_fs" value="" min="0" step="any">
+        </label>
+        <label>Movie frames &mdash; blank: 60, at most 120
+          <input type="number" name="td_frame_count" value="" min="1" max="120" step="1">
+        </label>
+      </div>
+      <p class="muted small">
+        The movie's frames are spread evenly over this window, and the last one is
+        at its end. A shorter window spends the same frames on less time, so it
+        shows faster detail; the job page states the spacing in fs and in cycles of
+        the source frequency, and says when the frames are too far apart to show the
+        oscillation itself. At most 120 frames are kept, about a megabyte each at
+        the largest field the grid records, and the page loads them all before
+        playing.
+      </p>
+      <div class="row" data-when="td_profile:drawn">
+        <label>Waveform samples (numbers, spaced evenly in time)
+          <textarea name="td_samples" rows="2" placeholder="0 0.5 1 0.5 0 -0.5 -1 -0.5 0" data-required></textarea>
+        </label>
+        <label>Waveform lasts (fs)
+          <input type="number" name="td_sample_duration_fs" value="" min="0" step="any" data-required>
+        </label>
+      </div>
+      <p class="muted small" data-when="td_profile:drawn">
+        Your waveform is played once, from the start of the run, and is zero after
+        it ends. Its average is removed first, because a source with a non-zero
+        average leaves a charge behind. A waveform with sharper detail than the
+        grid can carry is refused, naming the highest frequency the grid resolves.
+      </p>
+      <label>Probes &mdash; one per line: x y z and the field component it records
+        <textarea name="td_probes" rows="3" placeholder="0.5 0.5 0.8 z" data-required></textarea>
+      </label>
+      <p class="muted small">
+        A smaller cell size resolves finer detail but makes the run much larger:
+        halving it is about sixteen times the work. The app refuses a run that
+        would be too big or too long before it is queued, and says which limit
+        was hit; it also refuses a source or probe that lands in a metal, outside
+        the grid or inside the absorbing layer at its edge.
+      </p>
+    </fieldset>
+
+    <button type="submit" id="submit-button">Compute modes</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Recent jobs</h2>
+  {% if jobs %}
+    <table class="jobs">
+      <thead><tr><th>Object</th><th>Kind</th><th>Uploaded</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for job in jobs %}
+        <tr>
+          <td><a href="{{ url_for('job_page', job_id=job.job_id) }}">{{ job.original_filename or job.job_id }}</a></td>
+          {# A pc job has no uploaded object, so its name is the cell. Say which
+             kind it is here rather than leaving the reader to open the page:
+             two rows can otherwise look identical and one of them is a 2-D
+             band diagram, not a 3-D object. #}
+          <td class="muted">{{ {'pc': 'crystal', 'td': 'time-domain'}.get(job.kind, 'object') }}</td>
+          <td class="muted">{{ job.created_at }}</td>
+          <td><span class="pill pill-{{ job.status }}">{{ job.status }}</span>
+              {% if job.stage and job.stage != job.status %}<span class="muted small">{{ job.stage }}</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No objects yet.</p>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Show the arms of the form that belong to the chosen mode. Each `.mode-detail`
+// fieldset lists its modes in `data-modes`; inside one, an element with
+// `data-when="field:value"` shows only while that field has that value (the td
+// source's position vs direction, the pulse bandwidth, the drawn waveform).
+//
+// `required` is toggled WITH visibility: a hidden `required` box blocks the POST
+// and the browser then cannot focus it, so the owner sees "not focusable"
+// pointing at a control that is not on the page. A control is made required
+// only when it is marked `data-required` AND nothing above it is hidden, so the
+// optional ones (scale, feature size) never block a submission. The button
+// label follows the mode, because "Compute modes" over a band-diagram request
+// is the wrong promise.
+(function () {
+  var form = document.getElementById('upload-form');
+  var select = document.getElementById('mode-select');
+  if (!form || !select) return;
+  var button = document.getElementById('submit-button');
+  var labels = {
+    cavity: 'Compute modes',
+    pc: 'Compute the band diagram',
+    td: 'Run the time-domain simulation',
+  };
+
+  function fieldValue(name) {
+    var field = form.elements[name];
+    return field ? field.value : null;
+  }
+
+  function apply() {
+    var chosen = labels.hasOwnProperty(select.value) ? select.value : 'cavity';
+    form.querySelectorAll('.mode-detail').forEach(function (arm) {
+      arm.hidden = (arm.dataset.modes || '').split(/\s+/).indexOf(chosen) < 0;
+    });
+    form.querySelectorAll('[data-when]').forEach(function (el) {
+      var rule = el.dataset.when.split(':');
+      el.hidden = fieldValue(rule[0]) !== rule[1];
+    });
+    form.querySelectorAll('[data-required]').forEach(function (input) {
+      if (input.closest('[hidden]')) {
+        input.removeAttribute('required');
+      } else {
+        input.setAttribute('required', '');
+      }
+    });
+    // A hidden control is also disabled, so it is not posted: a file chosen
+    // before switching to the crystal arm would otherwise ride along and get
+    // the crystal request refused for a file the owner can no longer see.
+    form.querySelectorAll('.mode-detail input, .mode-detail select, .mode-detail textarea')
+      .forEach(function (input) {
+        input.disabled = !!input.closest('[hidden]');
+      });
+    if (button) button.textContent = labels[chosen];
+  }
+  form.addEventListener('change', apply);
+  apply();
+
+  // Per-part materials for a multi-part time-domain object. The part names come
+  // from /parts (the solver's own parser), never from a scan here; each part gets
+  // a material select and, for "refractive index", a number box, which together
+  // fill one hidden `part_index.<name>` field. A response for an earlier file is
+  // dropped. A failed /parts call is SAID, never shown as "one part": the server
+  // then refuses a multi-part upload by name rather than guessing a material.
+  var partsBox = document.getElementById('td-parts');
+  var partsNote = document.getElementById('td-parts-note');
+  var oneIndex = document.getElementById('td-one-index');
+  var named = {{ td_materials | list | tojson }};
+  var asked = 0;
+
+  function clearParts(note) {
+    partsBox.textContent = '';
+    partsBox.hidden = true;
+    oneIndex.hidden = false;
+    partsNote.textContent = note || '';
+    partsNote.hidden = !note;
+  }
+
+  function picker(name) {
+    var label = document.createElement('label');
+    label.appendChild(document.createTextNode('Material of part \u201c' + name + '\u201d'));
+    var kind = document.createElement('select');
+    [['index', 'refractive index']].concat(named.map(function (m) {
+      return [m, m === 'pec' ? 'perfect conductor (pec)' : m];
+    })).forEach(function (o) {
+      var opt = document.createElement('option');
+      opt.value = o[0];
+      opt.textContent = o[1];
+      kind.appendChild(opt);
+    });
+    var n = document.createElement('input');
+    n.type = 'number'; n.min = '1'; n.step = 'any'; n.value = '1.5';
+    n.setAttribute('data-required', '');
+    n.setAttribute('aria-label', 'Refractive index of part ' + name);
+    var posted = document.createElement('input');
+    posted.type = 'hidden';
+    posted.name = 'part_index.' + name;
+    function sync() {
+      n.hidden = kind.value !== 'index';
+      posted.value = kind.value === 'index' ? n.value : kind.value;
+    }
+    kind.addEventListener('change', sync);
+    n.addEventListener('input', sync);
+    sync();
+    label.appendChild(kind);
+    label.appendChild(n);
+    label.appendChild(posted);
+    return label;
+  }
+
+  // A coating for any part, one-part objects included: "no coating" (the
+  // default) posts nothing; otherwise `part_coating.<name>` carries the
+  // material and `part_coating_thickness.<name>` its thickness in the form's
+  // length unit. With no coating both lose their names, so nothing is posted
+  // (disabling is not enough: apply() re-enables every control not hidden).
+  function coatingPicker(name) {
+    var label = document.createElement('label');
+    label.className = 'td-coating';
+    label.appendChild(document.createTextNode('Coating on part \u201c' + name + '\u201d'));
+    var kind = document.createElement('select');
+    kind.setAttribute('aria-label', 'Coating material of part ' + name);
+    [['', 'no coating'], ['index', 'refractive index']].concat(named.map(function (m) {
+      return [m, m === 'pec' ? 'perfect conductor (pec)' : m];
+    })).forEach(function (o) {
+      var opt = document.createElement('option');
+      opt.value = o[0];
+      opt.textContent = o[1];
+      kind.appendChild(opt);
+    });
+    var n = document.createElement('input');
+    n.type = 'number'; n.min = '1'; n.step = 'any'; n.value = '1.5';
+    n.setAttribute('aria-label', 'Refractive index of the coating of part ' + name);
+    var thick = document.createElement('input');
+    thick.type = 'number'; thick.min = '0'; thick.step = 'any'; thick.value = '0.01';
+    thick.setAttribute('aria-label', 'Coating thickness of part ' + name +
+                       ' (in the length unit)');
+    var posted = document.createElement('input');
+    posted.type = 'hidden';
+    function sync() {
+      var none = kind.value === '';
+      n.hidden = kind.value !== 'index';
+      thick.hidden = none;
+      thick.required = !none;
+      thick.name = none ? '' : 'part_coating_thickness.' + name;
+      posted.name = none ? '' : 'part_coating.' + name;
+      posted.value = kind.value === 'index' ? n.value : kind.value;
+    }
+    kind.addEventListener('change', sync);
+    n.addEventListener('input', sync);
+    sync();
+    label.appendChild(kind);
+    label.appendChild(n);
+    label.appendChild(thick);
+    label.appendChild(posted);
+    return label;
+  }
+
+  function askParts() {
+    var file = form.elements['meshfile'];
+    var ticket = ++asked;
+    if (select.value !== 'td' || !file || !file.files || !file.files.length) {
+      clearParts('');
+      apply();
+      return;
+    }
+    var body = new FormData();
+    body.append('meshfile', file.files[0]);
+    body.append('units', fieldValue('units') || '');
+    body.append('mode', 'td');
+    fetch('{{ url_for("parts") }}', {method: 'POST', body: body})
+      .then(function (r) { return r.json().then(function (j) { return [r.ok, j]; }); })
+      .then(function (res) {
+        if (ticket !== asked) return;
+        var ok = res[0], j = res[1];
+        if (!ok || !Array.isArray(j.parts)) {
+          clearParts('Could not read this object\u2019s parts: ' +
+                     ((j && j.error) || 'no answer from the server') + '.');
+        } else {
+          clearParts('');
+          var several = j.parts.length > 1;
+          j.parts.forEach(function (name) {
+            if (several) partsBox.appendChild(picker(name));
+            partsBox.appendChild(coatingPicker(name));
+          });
+          partsBox.hidden = !j.parts.length;
+          oneIndex.hidden = several;
+        }
+        apply();
+      })
+      .catch(function (err) {
+        if (ticket !== asked) return;
+        clearParts('Could not read this object\u2019s parts: ' + err + '.');
+        apply();
+      });
+  }
+  ['meshfile', 'units'].forEach(function (name) {
+    var field = form.elements[name];
+    if (field) field.addEventListener('change', askParts);
+  });
+  select.addEventListener('change', askParts);
+})();
+</script>
+{% endblock %}

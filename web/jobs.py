@@ -1,0 +1,748 @@
+"""The solver Job: its manifest, and launching/deleting it.
+
+This is a plain ``batch/v1`` Job in the ``mode-search-engine`` namespace -- *not*
+a SparkApplication, and nothing is ever created in ``default`` (see the task-2
+amendment; the Spark operator only watches ``default``, which is outside the
+owner's power cap).
+
+``build_job_manifest`` is a **pure function**: same arguments in, same dict out,
+no environment, no clock, no cluster. That is what the tests pin.
+
+Concurrency is one. The namespace quota counts finished Jobs too, so a finished
+Job is deleted as soon as its result is in the database rather than waiting for
+``ttlSecondsAfterFinished``.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+# The shared module, reached the way web/config.py does it: the web image ships
+# mse_common next to the app, a checkout has it beside the solver. Both paths
+# are in place because the same source is imported both ways.
+_COMMON_ROOT = Path(__file__).resolve().parent.parent / "dockerfiles" / "maxwell_solver"
+if str(_COMMON_ROOT) not in sys.path:
+    sys.path.insert(0, str(_COMMON_ROOT))
+import mse_common as COMMON  # noqa: E402  # also the backend NAMES, never retyped
+
+#: The GPU backend name, taken from the module BOTH images ship.
+#:
+#: This line used to read ``import mse_backend``, to avoid retyping the literal
+#: ``"cuda"`` (which was wrong -- ``mse_backend`` accepts only cpu and gpu). The
+#: literal was indeed wrong, but ``mse_backend`` imports scipy at module level
+#: and the web image has no scipy, so the deployed image crashlooped at import:
+#: ``ModuleNotFoundError: No module named 'mse_backend'`` (mse-web 072ed7a,
+#: rolled back; Recreate strategy meant the site was down until the rollback).
+#: The names now live in ``mse_common``, which both images COPY. Copying
+#: ``mse_backend.py`` into the web image is NOT a fix: it would drag in scipy.
+_GPU_BACKEND = COMMON.GPU
+
+#: label values must be DNS-1123-ish; a job id is a uuid but be defensive
+_UNSAFE = re.compile(r"[^a-z0-9.-]")
+
+#: the solver CLI takes n-modes; the owner-facing default lives in config
+DEFAULT_N_MODES = 20
+
+#: where the cluster Job's materials table lives in object storage, relative to
+#: the job's prefix. The same name the upload writes and the solver reads, so
+#: there is one spelling of it in the tree -- see the note in
+#: ``build_job_manifest`` for why it is a file and not an argument.
+_MATERIALS_OBJECT = "input.materials.json"
+
+#: The thread-count variables a numerically threaded container must set to its
+#: CPU limit, because a cgroup limit does not change ``os.cpu_count()``.
+_THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+               "NUMEXPR_NUM_THREADS")
+
+
+def job_name(job_id) -> str:
+    """Deterministic, DNS-1123-safe Kubernetes object name for a job id."""
+    clean = _UNSAFE.sub("-", str(job_id).lower()).strip("-.")
+    return f"mse-solver-{clean[:48]}"
+
+
+def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
+                       solver_image: str, pull_secret: str, namespace: str,
+                       cpu: str = "4", memory: str = "14Gi",
+                       active_deadline_seconds: int = 1800,
+                       ttl_seconds_after_finished: int = 30,
+                       max_tets: int | None = None,
+                       cpu_max_tets: int | None = None,
+                       min_feature_m: float | None = None,
+                       scale: float = 1.0,
+                       materials: dict | None = None,
+                       graded_meshing: bool = True,
+                       gpu: bool = False,
+                       gpu_product: str = "NVIDIA-RTX-A4000",
+                       gpu_node: str = "gpu-node-b"):
+    """Return the ``batch/v1`` Job manifest that solves one upload.
+
+    Pure: no environment lookups, no cluster calls, no time.
+
+    The shape is dictated by the amendment:
+    ``envFrom`` the ``mse-minio``/``mse-db`` Secrets, ``imagePullSecrets``
+    (the Harbor project is private, so the pull secret is required),
+    ``restartPolicy: Never``, ``backoffLimit: 0`` (a failed solve must not be
+    retried -- it would spend another ten minutes reaching the same error),
+    and ``requests == limits`` so the Job is Guaranteed and the quota, not the
+    scheduler, decides admission.
+    """
+    name = job_name(job_id)
+    labels = {"app": "mse-solver", "job-id": str(job_id)}
+    args = [
+        "--job-id", str(job_id),
+        "--units", str(units),
+        "--n-index", repr(float(n_index)),
+        "--n-modes", str(int(n_modes)),
+    ]
+    env = [
+        # Named explicitly, not left to the solver's default. This image has no
+        # CUDA stack, so "cpu" is the only value that can work here -- but a
+        # default that agrees with the image is a default that hides a mistake,
+        # and the backend is the first thing to check when a run is slow.
+        {"name": "MSE_SOLVER_BACKEND", "value": "cpu"},
+        # The per-region grading switch, forwarded so the Job meshes the mesh the
+        # app just priced. The app reads it from ITS environment (the same
+        # accessor the solver uses, ``mse_common.graded_meshing_enabled``) and
+        # sends the resulting setting explicitly: a Job pod starts from the
+        # image's default, so leaving it off would let a rollback reach the web
+        # pod while the solver kept grading -- the estimate would price one mesh
+        # and the Job build another, which is the one failure this switch exists
+        # to prevent.
+        {
+            "name": COMMON.GRADED_MESHING_ENV,
+            "value": "1" if graded_meshing else "0",
+        },
+    ]
+    if max_tets is not None:
+        # The solver's ABSOLUTE cap, sent explicitly. Its own default is the
+        # same number, but the app is the thing that decides which uploads are
+        # allowed through, so the app is the thing that must say what the limit
+        # is. Omitting it was the defect: the app accepted up to 600k while the
+        # solver refused above 80k, and every job in between died on a limit the
+        # owner had never been told about.
+        env.append({"name": "MSE_MAX_TETS", "value": str(int(max_tets))})
+    if cpu_max_tets is not None:
+        # The solver re-decides the route on the exact tetrahedron count, at the
+        # first point that count exists. Handing it the same boundary the app
+        # routed on is what makes that second decision agree with the first
+        # instead of inventing a different one.
+        env.append({"name": "MSE_CPU_MAX_TETS", "value": str(int(cpu_max_tets))})
+    if min_feature_m is not None:
+        # The owner's declared smallest feature, in METRES -- converted once at
+        # the upload form from its own nm/um/mm selector, never from the
+        # object's units. Passed as a flag rather than an env var because it is a
+        # property of THIS upload, not of the machine -- two jobs on one node
+        # have different feature sizes, and an env var is the wrong shape for a
+        # per-job value.
+        args += ["--min-feature", repr(float(min_feature_m))]
+    if scale is not None and float(scale) != 1.0:
+        # Omitted when 1.0 so a job with no scaling is byte-identical to what
+        # this function produced before the argument existed -- which is what
+        # the pre-existing tests assert against.
+        args += ["--scale", repr(float(scale))]
+    # Materials are NOT passed in argv. Two reasons, and the first one is
+    # enough: argv is world-readable on the shared VM -- any seat's `ps` shows
+    # it -- and this is a data structure that will only grow (a dozen parts is
+    # already long, and a quoted JSON blob on a command line is a parsing bug
+    # waiting for the first part name with a space in it). The Job carries the
+    # table as an OBJECT IN MINIO, ``input.materials.json``, which the solver
+    # already has credentials for and already reads its geometry from.
+    #
+    # The flag says only WHETHER the table exists. Absent means the one-part
+    # vacuum path, exactly as before this argument was added; present means the
+    # solver must find the object and refuse if it cannot. That is deliberately
+    # not "present iff materials is not None" reversed -- a missing object with
+    # the flag set is an error, never a silent fallback to vacuum, because
+    # falling back would solve a different problem than the owner asked for and
+    # report it as success.
+    if materials is not None:
+        args += ["--materials-from", _MATERIALS_OBJECT]
+    if gpu:
+        # The same CLI, run against the GPU backend. The NAME comes from
+        # mse_common.BACKENDS, never a typed literal: this line said "cuda"
+        # once, while the solver accepts only "cpu" and "gpu", so every A4000
+        # job died at backend selection and no test noticed -- the tests never
+        # compared this value with the set the solver actually accepts.
+        # mse_common, not mse_backend: the web image does not ship mse_backend.
+        env = [e for e in env if e["name"] != "MSE_SOLVER_BACKEND"]
+        env.append({"name": "MSE_SOLVER_BACKEND", "value": _GPU_BACKEND})
+        # MSE_CPU_MAX_TETS describes the CPU machine. The solver only consults it
+        # on the cpu backend, so leaving it would be harmless -- but it would
+        # name a limit for a machine this Job is not running on, and a reader
+        # would reasonably ask which of the two contradicting env vars wins.
+        env = [e for e in env if e["name"] != "MSE_CPU_MAX_TETS"]
+        # Match the thread count to the CPU limit (measured: a cgroup limit does
+        # not change os.cpu_count(), so an unset count starts one thread per HOST
+        # core and is throttled hard). The image already bakes in 4 for the same
+        # reason, and 4 is the Job size -- so this is a no-op today, and is
+        # derived from the limit rather than left to that coincidence: raising
+        # JOB_CPU without this would silently leave BLAS under-threaded.
+        for var in _THREAD_ENV:
+            env = [e for e in env if e["name"] != var]
+            env.append({"name": var, "value": str(int(float(cpu)))})
+
+    # requests == limits so the Job is Guaranteed and the quota, not the
+    # scheduler, decides admission. The GPU is requested as a first-class
+    # resource in both, which is what the namespace quota counts.
+    resources_res = {"cpu": cpu, "memory": memory}
+    if gpu:
+        resources_res["nvidia.com/gpu"] = 1
+
+    pod_spec = {
+        "restartPolicy": "Never",
+        # The solver only talks to MinIO and Postgres through env
+        # credentials; it never calls the Kubernetes API, so do not
+        # hand it a token that could be used to reach the cluster.
+        "automountServiceAccountToken": False,
+        "imagePullSecrets": [{"name": pull_secret}],
+        "containers": [
+            {
+                "name": "solver",
+                "image": solver_image,
+                "args": args,
+                "env": env,
+                "envFrom": [
+                    {"secretRef": {"name": "mse-minio"}},
+                    {"secretRef": {"name": "mse-db"}},
+                ],
+                "resources": {
+                    "requests": dict(resources_res),
+                    "limits": dict(resources_res),
+                },
+            }
+        ],
+    }
+    if gpu:
+        # Pin the card rather than "any GPU": the quota counts GPUs, but a node
+        # could carry a different model, and the manifest's memory price is the
+        # A4000's. The selector names the product, not the node, so a relabelled
+        # node cannot silently match. The node is pinned too (owner, 2026-10-16):
+        # gpu-node-a's two A4000s belong to the hcm team; ours is gpu-node-b.
+        pod_spec["nodeSelector"] = {"kubernetes.io/hostname": gpu_node,
+                                    "nvidia.com/gpu.product": gpu_product}
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
+        "spec": {
+            # The quota tallies finished Jobs, so the TTL is only a backstop for
+            # the tick having died; the app deletes the Job itself once the
+            # result is recorded.
+            "ttlSecondsAfterFinished": int(ttl_seconds_after_finished),
+            "activeDeadlineSeconds": int(active_deadline_seconds),
+            "backoffLimit": 0,
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": pod_spec,
+            },
+        },
+    }
+
+
+class K8sJobLauncher:
+    """Create/delete the solver Job through the in-cluster Kubernetes API.
+
+    Everything the request needs is passed in, so the object can be built in
+    tests (and with ``dry_run``) without a cluster.
+    """
+
+    def __init__(self, namespace: str, image: str, pull_secret: str,
+                 gpu_image: str | None = None,
+                 cpu: str = "4", memory: str = "14Gi",
+                 active_deadline_seconds: int = 1800,
+                 ttl_seconds_after_finished: int = 30, dry_run: bool = False,
+                 max_tets: int | None = None,
+                 cpu_max_tets: int | None = None):
+        self.namespace = namespace
+        self.image = image
+        # Required for a GPU job and never substituted for ``image``: the CPU
+        # image has no CUDA stack. A GPU job with no gpu_image is a refusal,
+        # not a degraded run.
+        self.gpu_image = gpu_image
+        self.pull_secret = pull_secret
+        self.cpu = cpu
+        self.memory = memory
+        self.max_tets = max_tets
+        self.cpu_max_tets = cpu_max_tets
+        self.active_deadline_seconds = active_deadline_seconds
+        self.ttl_seconds_after_finished = ttl_seconds_after_finished
+        self.dry_run = dry_run
+        self._client = None
+
+    def _batch(self):
+        # imported lazily so the app imports (and the tests run) with no kube
+        # configuration present at all
+        if self._client is None:
+            from kubernetes import client, config
+
+            try:
+                config.load_incluster_config()
+            except Exception:  # noqa: BLE001 - fall back for local/dev use
+                config.load_kube_config()
+            self._client = client.BatchV1Api()
+            self._core_api = client.CoreV1Api()
+        return self._client
+
+    def manifest(self, job_id, units: str, n_index: float, n_modes: int,
+                 min_feature_m: float | None = None,
+                 scale: float = 1.0,
+                 materials: dict | None = None,
+                 gpu: bool = False) -> dict:
+        if gpu and not self.gpu_image:
+            raise ValueError(
+                "a GPU job needs a CUDA solver image (gpu_image), and there is "
+                "none configured. Refusing rather than launching the CPU image, "
+                "which has no CUDA stack and would die after taking the quota "
+                "slot. Set MSE_SOLVER_GPU_IMAGE in the Deployment."
+            )
+        return build_job_manifest(
+            job_id, units, n_index, n_modes,
+            self.gpu_image if gpu else self.image, self.pull_secret,
+            self.namespace, cpu=self.cpu, memory=self.memory,
+            active_deadline_seconds=self.active_deadline_seconds,
+            ttl_seconds_after_finished=self.ttl_seconds_after_finished,
+            max_tets=self.max_tets,
+            cpu_max_tets=self.cpu_max_tets,
+            min_feature_m=min_feature_m, scale=scale, materials=materials,
+            # Read here, at the impure boundary, so ``build_job_manifest`` stays
+            # pure: this is the app's own setting, the one ``estimate_tets``
+            # priced the upload with.
+            graded_meshing=COMMON.graded_meshing_enabled(),
+            gpu=gpu,
+        )
+
+    # -- cluster state -----------------------------------------------------
+    def active_job_names(self) -> list[str]:
+        """Names of Jobs with our labels that still occupy the quota slot.
+
+        A Job counts against ``count/jobs.batch`` from creation until deletion,
+        including while it is finished, so "occupying" means "exists".
+
+        Raises on 403 rather than returning ``[]``. An empty list is a *claim*
+        that nothing is there, and both of this method's callers act on that
+        claim: the tick launches, and ``_fail_dead_jobs`` fails every running
+        row. Swallowing a 403 into ``[]`` therefore starts a Job against a quota
+        we could not read, or -- worse -- fails a live solve whose only problem
+        was that we were not allowed to look at it. Letting the exception out
+        makes each caller see "could not ask", which they already handle.
+        """
+        if self.dry_run:
+            return []
+        from kubernetes import client
+
+        api = self._batch()
+        try:
+            jobs = api.list_namespaced_job(
+                self.namespace, label_selector="app=mse-solver"
+            )
+        except client.ApiException as exc:
+            if exc.status == 403:
+                raise CannotAskCluster(
+                    "not allowed to list solver jobs"
+                ) from exc
+            raise
+        return [j.metadata.name for j in jobs.items]
+
+    def is_quota_exceeded(self, exc: Exception) -> bool:
+        """A 403 'exceeded quota' means wait, not fail.
+
+        Distinct from :func:`_as_launch_error`, which turns the same exception
+        into ``QuotaExceeded`` for the launch path; this is the predicate form
+        the tests and any caller holding a bare exception use.
+        """
+        status = getattr(exc, "status", None)
+        body = str(getattr(exc, "body", "") or str(exc))
+        return status == 403 and "exceeded quota" in body.lower()
+
+    def job_states(self) -> dict[str, str]:
+        """``{job name: failure reason}`` for our Jobs that have FAILED.
+
+        Only failures are reported, so a name absent from the result means
+        "exists and has not failed". A caller distinguishes the three cases it
+        cares about by crossing this with ``active_job_names``: running (present
+        in both), dead-and-failed (in this dict), and gone (in neither).
+
+        The reason is a best-effort plain word -- ``DeadlineExceeded`` from the
+        Job's own condition, or a container's ``OOMKilled``/``Error`` -- and may
+        be ``""`` when Kubernetes does not say. Callers must not depend on it
+        being one of a fixed set.
+
+        Raises on 403, for the same reason ``active_job_names`` does: an empty
+        dict is indistinguishable from "every Job is healthy", and callers act
+        on it.
+        """
+        if self.dry_run:
+            return {}
+        from kubernetes import client
+
+        api = self._batch()
+        try:
+            jobs = api.list_namespaced_job(
+                self.namespace, label_selector="app=mse-solver"
+            )
+        except client.ApiException as exc:
+            if exc.status == 403:
+                raise CannotAskCluster(
+                    "not allowed to list solver jobs"
+                ) from exc
+            raise
+
+        states: dict[str, str] = {}
+        for job in jobs.items:
+            job_status = getattr(job, "status", None)
+            pods = None if _names_the_failure_itself(
+                _job_condition_reason(job_status)) else self._job_pods(job)
+            reason = _failed_reason(job, pods)
+            if reason is None:
+                continue
+            # A job that died asking to be re-routed says so in its pod's last
+            # state, which is the only channel a dead container has. `_failed_reason`
+            # reads the pods for OOMKilled and would not recognise this, so the
+            # pods are inspected once more here rather than in a second list call.
+            if _REROUTE_REASON is not None and wants_reroute(pods):
+                states[job.metadata.name] = _REROUTE_REASON
+            else:
+                states[job.metadata.name] = reason
+        return states
+
+    def _job_pods(self, job) -> list:
+        """The pods belonging to ``job``, or ``[]`` if we cannot list them.
+
+        A pod list is how a container's ``OOMKilled`` becomes visible -- the
+        Job's status holds no pods. Failing to list them must not sink the whole
+        tick: the Job's own condition still says *that* it failed, so the caller
+        falls back to a reason it does have rather than losing the failure.
+        """
+        from kubernetes import client
+
+        name = getattr(getattr(job, "metadata", None), "name", None)
+        if not name:
+            return []
+        try:
+            return list(self._core().list_namespaced_pod(
+                self.namespace, label_selector=f"job-name={name}"
+            ).items)
+        except client.ApiException:
+            # Not allowed, or the pod is already gone. The Job's own condition
+            # still says *that* it failed, so the caller keeps that reason rather
+            # than losing the failure to a failed lookup.
+            return []
+        except Exception as exc:  # noqa: BLE001
+            # Nothing about naming an OOMKilled container is worth failing a
+            # scheduler tick for. If the core API is unreachable for any reason
+            # at all, fall back to the reason we already have -- but say so, so
+            # a swallowed lookup cannot pass for "this Job has no pods".
+            print(f"[mse-web] could not list pods for {name}: {exc}", flush=True)
+            return []
+
+    def _core(self):
+        """The CoreV1 API, built alongside the batch one.
+
+        ``_batch()`` short-circuits when a client is already assigned (the tests
+        do that to run without a cluster), so the core client is built here if
+        that path skipped it.
+        """
+        self._batch()
+        if getattr(self, "_core_api", None) is None:
+            from kubernetes import client
+
+            self._core_api = client.CoreV1Api()
+        return self._core_api
+
+    # -- mutation ----------------------------------------------------------
+    def create(self, job_id, units: str, n_index: float, n_modes: int,
+               min_feature_m: float | None = None, scale: float = 1.0,
+               materials: dict | None = None, kind: str | None = None,
+               gpu: bool = False) -> str:
+        """Create the Job and return its name.
+
+        ``materials`` is passed for the FLAG only -- it decides whether the
+        solver is told to look for the table. The table itself was written to
+        object storage by the upload, before this is called, so a Job can never
+        be launched pointing at a table that has not been stored yet.
+
+        ``kind`` is a REFUSAL, not a dispatch: this launcher builds exactly one
+        Job shape, the cavity solver, and a ``kind='pc'`` row must never be
+        turned into one. ``next_queued`` already skips pc rows, so reaching here
+        with one means that filter was bypassed -- a second caller, a direct
+        call, a row whose kind changed after it was queued. Failing loudly names
+        the kind, because the alternative is a band diagram that quietly comes
+        back as a cavity solve of nothing. When ``kind`` is None the caller did
+        not say, which is every existing cavity caller; the guard is explicit
+        only about the kinds it can recognise as not-its-own.
+        """
+        if kind is not None and kind != "cavity":
+            raise JobLaunchError(
+                f"the cluster launcher runs cavity jobs only; it was handed "
+                f"kind={kind!r}. A pc job is solved on the Jetson worker "
+                f"(target=jetson), not here."
+            )
+        manifest = self.manifest(job_id, units, n_index, n_modes,
+                                 min_feature_m=min_feature_m, scale=scale,
+                                 materials=materials, gpu=gpu)
+        if self.dry_run:
+            return manifest["metadata"]["name"]
+        from kubernetes import client
+
+        api = self._batch()
+        try:
+            api.create_namespaced_job(self.namespace, manifest)
+        except client.ApiException as exc:
+            raise _as_launch_error(exc) from exc
+        return manifest["metadata"]["name"]
+
+    def delete(self, name: str) -> None:
+        """Delete a Job (and its pods) once its result is recorded."""
+        if self.dry_run or not name:
+            return
+        from kubernetes import client
+
+        api = self._batch()
+        try:
+            api.delete_namespaced_job(
+                name, self.namespace,
+                body=client.V1DeleteOptions(propagation_policy="Background"),
+            )
+        except client.ApiException as exc:
+            if exc.status != 404:  # already gone is success
+                raise
+
+
+def _job_condition_reason(status) -> str | None:
+    """The ``Failed`` condition's reason, or ``None`` if it is not set yet.
+
+    Split out so a caller can ask "does the Job itself already say why?" without
+    paying for a pod list. Returns ``""`` (not ``None``) when the condition is
+    set but carries no reason -- that is still a failure, so the caller must not
+    read it as "keep looking".
+    """
+    for cond in (getattr(status, "conditions", None) or []):
+        if getattr(cond, "type", "") == "Failed" and \
+                getattr(cond, "status", "") == "True":
+            return getattr(cond, "reason", "") or ""
+    return None
+
+
+def _names_the_failure_itself(reason: str | None) -> bool:
+    """Whether a Job condition reason is the best answer we will get.
+
+    Only ``DeadlineExceeded`` qualifies. It says the solver overran its own
+    budget, and no pod can sharpen that.
+
+    Every other failure under ``backoffLimit: 0`` arrives as
+    ``BackoffLimitExceeded`` -- including the OOM this app most needs to name.
+    Treating *any* condition as the whole answer is what hid ``OOMKilled``:
+    the condition appears within seconds and then persists, so the pod list was
+    skipped for exactly the steady state an owner would be looking at, and the
+    container's ``OOMKilled`` was only ever visible in the brief window before
+    the condition landed. So an unhelpful condition must fall through to the
+    pods, which is why this is a check on the *reason* and not on
+    ``reason is not None``.
+    """
+    return reason == "DeadlineExceeded"
+
+
+def _failed_reason(job, pods=None) -> str | None:
+    """A short reason string if the Job has FAILED, else ``None``.
+
+    Kubernetes signals this two ways and we check both: the Job's own
+    ``Failed`` condition (``DeadlineExceeded`` when ``activeDeadlineSeconds``
+    ran out, ``BackoffLimitExceeded``), and a container's termination reason
+    (``OOMKilled`` when the cgroup killed it). A Job with neither is not
+    treated as failed -- it is either running or finished successfully.
+
+    ``pods`` are the Job's pods, which the caller must list separately: a
+    ``V1JobStatus`` describes the Job, not its pods -- ``status.failed`` is a
+    *count*, not a list. Passing the Job alone therefore cannot name an
+    ``OOMKilled`` container, and asking this function to try was the bug.
+    """
+    status = getattr(job, "status", None)
+    if status is None:
+        return None
+
+    own = _job_condition_reason(status)
+    if _names_the_failure_itself(own):
+        return own
+    if own is not None and not pods:
+        # The Job says it failed and says nothing useful; without the pods there
+        # is nothing better to report, so report what we have.
+        return own
+
+    # A specific container reason beats an unhelpful condition: ``BackoffLimitExceeded``
+    # is what every failure under ``backoffLimit: 0`` gets, while ``OOMKilled``
+    # tells the owner what to actually change. This is the case the owner most
+    # needs named, which is why it is allowed to overwrite the condition.
+    for reason in ("OOMKilled", "Error"):
+        if _pods_have_reason(pods or [], reason):
+            return reason
+    return own if own is not None else None
+
+
+def _pods_have_reason(pods, reason: str) -> bool:
+    """Whether any container of any of these pods terminated with ``reason``.
+
+    Reads the shape the Python client returns; a plain dict is accepted too so
+    the tests can pass either. The ``state`` of a container is either a dict or
+    an object depending on how it was built, so both are handled once, in
+    ``_attr``, rather than guessed at per call site.
+    """
+    for pod in pods or []:
+        pod_status = _attr(pod, "status") or pod
+        for cs in (_attr(pod_status, "container_statuses") or []):
+            state = _attr(cs, "state")
+            if state is None:
+                continue
+            terminated = _attr(state, "terminated")
+            if terminated is None and isinstance(state, dict):
+                terminated = state.get("terminated")
+            if _attr(terminated, "reason", "") == reason:
+                return True
+    return False
+
+
+#: the token the solver writes to its termination log when it is on the wrong
+#: machine.
+#:
+#: IMPORTED from ``mse_common``, which the web image ships and the solver reads
+#: through ``mse_maxwell_solver`` -- one definition, so the app's grep can never
+#: look for a string the solver has stopped writing. It used to be retyped here
+#: with a test asserting the two literals were equal, which is the same
+#: arrangement one step later: two copies and a guard that notices the drift
+#: only if someone runs it.
+REROUTE_TOKEN = COMMON.REROUTE_TOKEN
+
+
+def wants_reroute(pods, token: str = REROUTE_TOKEN) -> bool:
+    """Whether any of these pods asked to be re-routed to another machine.
+
+    **Only a positive read counts.** A missing pod, a pod with no termination
+    message, a message that was truncated, an unreadable field -- every one of
+    them returns False, because the cost of the two mistakes is not symmetric:
+
+    * Wrongly rerouting a job that genuinely failed (a bad mesh, a bug) puts it
+      back in the queue, where it fails again on the other machine -- and, if the
+      other machine also reroutes it, could ping-pong.
+    * Wrongly *not* rerouting a job that asked costs the owner one upload, with
+      "too large for the processors available" on the job page, which is honest
+      and actionable.
+
+    This is the same rule the rig calls *could-not-ask must not look like
+    nothing-there*: "we could not read the message" is not evidence of anything
+    and must not be treated as "yes".
+
+    The token is matched as a substring because the solver writes
+    ``"<token>: <explanation>"``; the explanation is for a human reading the pod
+    and is deliberately not parsed.
+    """
+    for pod in pods or []:
+        pod_status = _attr(pod, "status") or pod
+        for cs in (_attr(pod_status, "container_statuses") or []):
+            for state_name in ("last_state", "state"):
+                state = _attr(cs, state_name)
+                if state is None and isinstance(cs, dict):
+                    state = cs.get(state_name)
+                terminated = _attr(state, "terminated")
+                if terminated is None and isinstance(state, dict):
+                    terminated = state.get("terminated")
+                if terminated is None:
+                    continue
+                message = _attr(terminated, "message", "") or ""
+                if token in str(message):
+                    return True
+    return False
+
+
+def _attr(obj, name, default=None):
+    """``getattr`` that also reads a plain dict, for fakes and real objects."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+#: owner-facing text per known failure reason. Kept deliberately plain: this is
+#: what appears on the job page, and the owner is not a Kubernetes operator.
+#:
+#: ``OOMKilled`` does NOT say "try a simpler object". A container killed for
+#: memory may have run out on a machine smaller than the problem needs, and the
+#: A4000 Job is exactly that case: the card's memory is the binding limit, not
+#: the object's shape. Telling the owner to simplify an object that is already
+#: fine sends them to redo work rather than retry, so the text names the machine
+#: and offers the retry the app can actually act on.
+FAILURE_MESSAGES = {
+    "DeadlineExceeded": (
+        "The solver took too long and was stopped. Try a simpler object, or "
+        "ask for fewer modes."
+    ),
+    "OOMKilled": (
+        "The solver ran out of memory on its machine. This is a limit of the "
+        "hardware, not necessarily anything wrong with the object -- retry, or "
+        "ask for fewer modes."
+    ),
+}
+
+#: used when the Job is gone or died without Kubernetes giving a reason
+FAILURE_DEFAULT = (
+    "The solver stopped unexpectedly. Please try a simpler object, or ask for "
+    "fewer modes."
+)
+
+
+#: the reason string that means "this job is on the wrong machine, move it".
+#: Deliberately not a Kubernetes reason and deliberately not in
+#: ``FAILURE_MESSAGES``: it is never shown to the owner, it is acted on. It
+#: exists so the reroute decision survives the trip through ``job_states``
+#: (a dict of name -> string) without widening that contract.
+_REROUTE_REASON = "MseReroute"
+
+
+def failure_message(reason: str | None) -> str:
+    """Plain English for the owner, from a Kubernetes reason.
+
+    Unknown reasons fall back rather than leaking a Kubernetes token into the
+    UI, and the reason is never interpolated verbatim.
+
+    ``MseReroute`` deliberately falls back to the generic message: it is an
+    instruction to the scheduler, not a diagnosis for a human, and if it ever
+    reaches here the job has already failed to reroute (or rerouted and failed
+    again) -- the owner then gets the actionable "too large for the processors
+    available", not the word ``MseReroute``.
+    """
+    if reason:
+        return FAILURE_MESSAGES.get(reason, FAILURE_DEFAULT)
+    return FAILURE_DEFAULT
+
+
+class JobLaunchError(Exception):
+    """The cluster refused the Job for a reason worth telling the owner."""
+
+
+class CannotAskCluster(Exception):
+    """We could not read cluster state -- distinct from reading it and finding nothing.
+
+    Raised when Kubernetes answers 403 to a list call. The two are not the same
+    thing and callers must not treat them as one an empty result would: an empty
+    list of Jobs means "there is nothing there", which is a licence to launch and
+    to fail every running row; "we were not allowed to look" is a licence for
+    neither. This used to be swallowed into an empty result, and the tick then
+    failed live solves whose only fault was being invisible to us.
+    """
+
+
+def _as_launch_error(exc: Exception) -> Exception:
+    """Translate a Kubernetes API error into something the app can handle."""
+    status = getattr(exc, "status", None)
+    body = str(getattr(exc, "body", "") or "")
+    if status == 403 and "exceeded quota" in body.lower():
+        return QuotaExceeded(body)
+    if status == 403:
+        return JobLaunchError(
+            "The service account is not allowed to start solver jobs."
+        )
+    return JobLaunchError(f"the solver job could not be started: {body or exc}")
+
+
+class QuotaExceeded(Exception):
+    """The namespace is full. This is a 'wait', not a 'fail'."""
