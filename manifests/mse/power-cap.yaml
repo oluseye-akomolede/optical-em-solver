@@ -1,10 +1,16 @@
-# Owner-approved power cap for mode-search-engine (2026-09-26, set by control-operator).
-# CHANGED 2026-11-02 by owner decision, ONE field only: requests.nvidia.com/gpu 0 -> 1.
-# The owner asked for owner-uploaded solves to run on a cluster RTX A4000 instead of the
-# Jetson, and chose ONE GPU card and ONE solve at a time (count/jobs.batch stays 1).
-# CPU and memory stay 5 / 18Gi: they do not depend on the GPU count, the owner did not
-# ask to tighten them, and a 3/7Gi cap leaves no headroom for an app rollout beside a
-# solve. Never raise it without the owner's OK (see escalation rule).
+# Owner-approved power cap for mode-search-engine. Originally 2026-09-26 (control-operator).
+# CHANGED 2026-11-12: the owner approved mse sharing hcm's two gpu-node-a A4000s, with
+# hcm's work taking priority. platform-lead raised this quota to match, and this file is
+# synced to the LIVE values as of 16:53Z that day -- it was stale and re-applying the old
+# version would have undone the raise.
+#
+# Two constraints that live OUTSIDE this file, and both are enforced on the cluster:
+#   * GPU pods on gpu-node-a MUST carry priorityClassName mse-hlst-low. An admission
+#     policy has required this since 16:52Z, so a worker1 GPU Job without it is rejected.
+#   * The app's own GPU Jobs pin kubernetes.io/hostname gpu-node-b instead. The shared
+#     worker1 cards are for hcm-first work; our uploads use the dedicated worker2 A4000.
+#
+# Never raise these without the owner's OK (see the escalation rule in the project brief).
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -12,13 +18,13 @@ metadata:
   namespace: mode-search-engine
 spec:
   hard:
-    count/jobs.batch: '1'
-    limits.cpu: '5'
-    limits.memory: 18Gi
-    pods: '5'
-    requests.cpu: '5'
-    requests.memory: 18Gi
-    requests.nvidia.com/gpu: '1'
+    count/jobs.batch: '3'
+    limits.cpu: '13'
+    limits.memory: 44Gi
+    pods: '7'
+    requests.cpu: '13'
+    requests.memory: 44Gi
+    requests.nvidia.com/gpu: '3'
 ---
 apiVersion: v1
 kind: LimitRange

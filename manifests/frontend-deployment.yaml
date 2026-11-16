@@ -15,6 +15,11 @@ spec:
     spec:
       containers:
         - name: flask-app
+          # :latest is deliberate here and is the only such tag allowed under
+          # manifests/. This is the original STL uploader, which is NOT
+          # deployed; mse-web replaced it. Pin it only if it is ever revived --
+          # the pin check in tests/test_deploy_artifacts.py refuses :latest
+          # everywhere under manifests/mse/ for exactly that reason.
           image: registry.example/mode-search-engine/mesh-uploader:latest
           ports:
             - containerPort: 5000

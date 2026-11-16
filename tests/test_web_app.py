@@ -691,6 +691,73 @@ def test_the_launcher_still_accepts_a_cavity_job_and_a_nameless_one():
     assert launcher.create(JOB_ID, "mm", 1.0, 6)
 
 
+def test_the_gpu_launcher_accepts_a_pc_job_because_the_gpu_image_can_run_it():
+    """A pc row on the GPU route is DISPATCHED, not refused.
+
+    The CPU refusal is right and stays: that image has no pc solver, so
+    launching it would take the single quota slot and die after the wait. The
+    GPU image carries ``pc_solve``/``td_solve`` (see Dockerfile.gpu), so the
+    same row that is refused on the CPU route must launch there. This is the
+    whole point of the change: a pc upload whose Jetson is offline has a
+    machine to run on.
+
+    Asserted on the manifest's args, not on the absence of an exception --
+    a launcher that accepted the row and built a CAVITY job would also not
+    raise, and that job would return a band diagram over the wrong thing.
+    """
+    for kind in (DB.PC, DB.TD):
+        launcher = JOBS.K8sJobLauncher("ns", "img", "secret", dry_run=True,
+                                       gpu_image="gpu-img")
+        name = launcher.create(JOB_ID, "mm", 1.0, 6, kind=kind, gpu=True)
+        assert name, "the GPU route must return the created Job's name"
+        manifest = launcher.manifest(JOB_ID, "mm", 1.0, 6, gpu=True, kind=kind)
+        args = manifest["spec"]["template"]["spec"]["containers"][0]["args"]
+        assert "--kind" in args and args[args.index("--kind") + 1] == kind, (
+            f"a {kind} row on the GPU route must hand the solver --kind {kind}; "
+            f"got {args!r}. Without it the solver defaults to 'cavity' and "
+            f"solves the wrong thing.")
+
+
+def test_a_pc_job_on_the_cpu_route_is_still_refused_by_name():
+    """The GPU dispatch must not open the CPU route.
+
+    Same row, same launcher, ``gpu`` left false: this is the case the original
+    guard exists for, and it must survive the change. A gate that accepts the
+    kind everywhere is not a gate.
+    """
+    launcher = JOBS.K8sJobLauncher("ns", "img", "secret", dry_run=True,
+                                   gpu_image="gpu-img")
+    with pytest.raises(JOBS.JobLaunchError) as excinfo:
+        launcher.create(JOB_ID, "mm", 1.0, 6, kind=DB.PC, gpu=False)
+    assert DB.PC in str(excinfo.value)
+    assert "jetson" in str(excinfo.value).lower()
+    assert "cluster-gpu" in str(excinfo.value), (
+        "the refusal must name the CPU route's limit; a reader told 'no' with "
+        "no reason will retry it")
+
+
+def test_the_cavity_manifest_is_byte_identical_after_the_kind_dispatch():
+    """--kind is appended ONLY for a non-cavity kind.
+
+    The cavity manifest was reviewed and deployed; a change that added
+    ``--kind cavity`` to it would be a difference the reviewer never saw, and
+    the solver's default already means 'cavity'. This pins that the dispatch
+    changed nothing on the path that was already live.
+    """
+    import json, sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "web"))
+    import jobs
+    old = jobs.build_job_manifest("j", "mm", 1.0, 20, "img", "sec", "ns")
+    new = jobs.build_job_manifest("j", "mm", 1.0, 20, "img", "sec", "ns",
+                                  kind="cavity")
+    assert json.dumps(old, sort_keys=True) == json.dumps(new, sort_keys=True), (
+        "kind='cavity' must produce the same manifest as no kind at all")
+    args = new["spec"]["template"]["spec"]["containers"][0]["args"]
+    assert "--kind" not in args, (
+        "the cavity Job must not carry --kind: its manifest is the one already "
+        "reviewed and deployed, and the solver's default is already 'cavity'")
+
+
 def _gpu_manifest():
     import sys, pathlib
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "web"))
@@ -729,7 +796,14 @@ def test_the_gpu_manifest_names_the_a4000_node_and_a_backend_the_solver_accepts(
     import sys, pathlib
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]
                            / "dockerfiles" / "maxwell_solver"))
-    import mse_backend
+    # ``mse_backend`` imports scipy at module scope, and scipy is in the SOLVER
+    # image, not the web image. This test reads the GPU manifest and belongs
+    # wherever the solver's own modules can be imported; run in the web image it
+    # would fail on an import that says nothing about the manifest. Skipped, not
+    # passed-by-luck: the dev VM happens to have scipy, so without this guard a
+    # green run here would not tell anyone the test cannot run where it ships.
+    mse_backend = pytest.importorskip(
+        "mse_backend", reason="needs the solver image's scipy (not in the web image)")
 
     spec = _gpu_manifest()["spec"]["template"]["spec"]
     # gpu-node-a's A4000s belong to the hcm team (owner, 2026-10-16): pin our node.

@@ -121,6 +121,41 @@ axisymmetric (r, z) form and the 3-D form SHALL give the same I-V.
 - **WHEN** a uniformly doped resistor cylinder of radius R is solved in the axisymmetric form
 - **THEN** its current is the 1-D current density times πR² within 1 %
 
+**[NOT MET ON THE 3-D PATH, 2026-11-10.]** The two scenarios above describe the axisymmetric
+form, which meets them. The coarse 3-D tet form cannot yet produce a *biased* current at all:
+any non-empty `biases` argument raises `EquilibriumNotReached`, because a bias solve runs the
+stage-3 coupled DD solve and stage 3 does not converge on the tet mesh (see the change's
+`2.7-feasibility.md` Finding 4 — it is a plateau, not a slow approach). Biased current has never
+been produced on the 3-D path. This is an open gap, not a tolerance to relax, and it is tracked
+as the refinement study in `tasks.md` 2.7. The 3-D path currently delivers the *equilibrium*
+agreement in the requirement below.
+
+### Requirement: The two forms SHALL agree on the built-in voltage and the depletion width at equilibrium
+At equilibrium at a doping both forms resolve, the axisymmetric (r, z) form and the coarse 3-D
+tet form SHALL agree on the built-in voltage AND on the depletion width. The built-in voltage
+alone is insufficient: it is fixed by the contact boundary condition and the intrinsic carrier
+concentration, so it is unchanged by a large error in the permittivity and proves only that both
+forms are wired to the same junction. The depletion width is the quantity that comes out of the
+Poisson solve.
+
+A width comparison SHALL be made only on a mesh that resolves the depletion region; at coarser
+tet edges the 3-D width is set by the mesher's sub-slab structure rather than by the physics.
+
+#### Scenario: The forms agree on the built-in voltage
+- **WHEN** the same abrupt junction is solved to equilibrium by both forms at ≤ 10¹⁶ cm⁻³
+- **THEN** the built-in voltages agree within 3 %, and each is within 1 % of the analytic value
+
+#### Scenario: The forms agree on the depletion width
+- **WHEN** the same junction is solved to equilibrium by both forms at a tet edge of 1e-7 m or
+  finer, so the depletion region is resolved
+- **THEN** the 10-90 % depletion widths agree within 5 %
+
+#### Scenario: The width test is sensitive to doping, not to permittivity
+- **WHEN** the acceptor or donor doping in the 3-D solve is doubled
+- **THEN** the width test fails; a 5 % change in permittivity is NOT claimed to fail it, because
+  the permittivity signal is smaller than the mesh discretisation error at any mesh that runs in
+  a unit test, and permittivity is instead covered by the axisymmetric width test
+
 ### Requirement: A voltage pulse SHALL give the carrier arrival profile at the dot
 `drift_diffusion.transient(..., waveform, dt, t_end)` SHALL step DEVSIM's transient solve from
 a solved bias through a voltage waveform. It SHALL return g(t), the rate at which electron-hole
@@ -150,3 +185,26 @@ record DEVSIM's version.
 #### Scenario: A dropped 2πr weight fails the bench
 - **WHEN** the axisymmetric form omits the 2πr weight
 - **THEN** the cylinder-area check fails and the bench exits 1
+
+### Requirement: A 3-D tetrahedral form SHALL run and be priced before it runs
+`solve_layered_dd_3d(..., edge_m, max_tets)` SHALL build a tetrahedral mesh of a layer stack,
+load it into DEVSIM as a Gmsh 2.2 file, and run the SAME staged drift-diffusion physics as the
+axisymmetric form. DEVSIM 2.11.2 has no 3-D mesh-create API, so the Gmsh file route is the only
+one; the array of contacts must come from surface physical groups written into that file, since
+the shipped `write_gmsh22` emits only 3-D tet groups. The mesh SHALL be written in centimetres,
+the unit `simple_physics` is validated in. The run SHALL be refused against the Job memory limit
+BEFORE the device is built, through the same estimate the axisymmetric path uses, so a refusal
+means the same thing whichever form is asking. It SHALL return the same keys as the
+axisymmetric DD solver so an agreement test can compare the two through one interface.
+
+#### Scenario: A 3-D device agrees with the axisymmetric one on the built-in voltage
+- **WHEN** the same abrupt junction is solved by both forms at a doping where both are resolved
+- **THEN** the measured built-in voltage agrees with the analytic value and with the other form
+
+#### Scenario: An oversize 3-D mesh is refused before any solve
+- **WHEN** the tetrahedral mesh would exceed the Job memory limit
+- **THEN** the call raises before any device is created, naming the estimate and the limit
+
+#### Scenario: A face shared by two tets does not become a contact
+- **WHEN** boundary faces are collected for contact groups
+- **THEN** a face with two owning tets is treated as interior and gets no group

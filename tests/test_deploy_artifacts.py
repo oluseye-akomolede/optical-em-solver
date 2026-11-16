@@ -323,3 +323,98 @@ def test_the_deployment_is_valid_yaml_and_keeps_one_replica():
     assert names == ["web"], f"unexpected containers: {names}"
     env_names = [e["name"] for e in containers[0].get("env", [])]
     assert "MSE_WORKER_TOKEN" in env_names
+
+
+def _image_refs():
+    """Every (manifest, where, value) that names an image, from both routes.
+
+    Two separate routes put an image name on a cluster: an env var whose name
+    contains IMAGE (the app passes it to a Job it starts), and a container's
+    own `image:` field (the pod the manifest deploys directly). The first
+    version of this test scanned only the env route, so
+    `mse-web:PLACEHOLDER` at deployment.yaml:33 and :51 -- the very lines this
+    test was written alongside -- passed. A scan that silently ignores half the
+    places an image can be named is worse than no scan, because it reads green.
+
+    Parsed from YAML rather than grepped, so the prose comments that discuss
+    PLACEHOLDER and the tags above every real value cannot satisfy this test.
+    """
+    yaml = pytest.importorskip("yaml")
+    for path in sorted((ROOT / "manifests").rglob("*.yaml")):
+        # Some manifests hold several documents (--- separated), so load_all.
+        docs = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+        for node in _walk(docs):
+            if not isinstance(node, dict):
+                continue
+            env = node.get("env")
+            if isinstance(env, list):
+                for item in env:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name") or ""
+                    if "IMAGE" not in name:
+                        continue
+                    yield path, name, item.get("value")
+            image = node.get("image")
+            if isinstance(image, str):
+                container = node.get("name") or "<unnamed container>"
+                yield path, f"container {container!r} image", image
+
+
+def _walk(node):
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk(value)
+
+
+def test_every_image_ref_is_a_real_pullable_tag():
+    """No image reference may be empty, tagless, ":latest", or a placeholder.
+
+    WHY this is a test and not a config check: the runtime guard in
+    config.py:308 refuses only an EMPTY MSE_SOLVER_GPU_IMAGE. A literal
+    "PLACEHOLDER" is truthy, so the app starts, the GPU Job takes the
+    namespace's single GPU slot, and only then dies at image pull -- the slot
+    is spent on a job that could never run. The runtime cannot catch it, so a
+    commit-time test has to.
+
+    The tag checks are separate because they fail differently: an empty value
+    passes the runtime guard only when it is not read at all, a tagless
+    "image:" is a valid string that pulls ":latest" implicitly, and a
+    PLACEHOLDER is the literal that shipped in deployment.yaml until
+    2026-11-11.
+    """
+    entries = list(_image_refs())
+    assert entries, "found no image references -- the scan is broken, not the manifests"
+    # The container-image route must be represented, not just the env route:
+    # the first version of this test checked env values only and let a
+    # placeholder through two deployed `image:` lines.
+    assert any(
+        not name.startswith("container ") for _, name, _ in entries
+    ) and any(
+        name.startswith("container ") for _, name, _ in entries
+    ), "both the env and container image routes must be scanned"
+    problems = []
+    for path, name, value in entries:
+        where = f"{path.relative_to(ROOT)}: {name}"
+        if value is None or not str(value).strip():
+            problems.append(f"{where} is empty")
+            continue
+        text = str(value)
+        if "PLACEHOLDER" in text.upper():
+            problems.append(f"{where} contains a placeholder: {text!r}")
+        if text.endswith(":"):
+            problems.append(f"{where} has an empty tag: {text!r}")
+        elif ":" not in text.rsplit("/", 1)[-1]:
+            problems.append(f"{where} has no tag at all: {text!r}")
+        elif text.rsplit(":", 1)[-1] == "latest" and "mse/" in path.as_posix():
+            # A :latest tag in the manifests this rig deploys is a moving
+            # target: the pod restarts onto a different image than the one
+            # reviewed. Refused here. manifests/frontend-deployment.yaml is
+            # the old undeployed uploader and is left alone deliberately --
+            # see the comment in that file -- so the rule keys on mse/.
+            problems.append(f"{where} uses a moving :latest tag: {text!r}")
+    assert not problems, "image references that cannot be pulled:\n  " + "\n  ".join(problems)

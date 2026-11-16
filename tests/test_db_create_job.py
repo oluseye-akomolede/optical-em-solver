@@ -125,8 +125,12 @@ def test_create_job_with_a_pc_request_sends_it_as_json_and_says_pc():
     store = _RecordingStore()
     pcs = {"lattice": "square", "r_over_a": 0.2, "n_rod": 3.5, "n_bg": 1.0,
            "n_bands": 12, "divisions": 16, "polarisation": "TM"}
+    # target=cluster-gpu: a pc kind is a GPU solve, and create_job refuses one
+    # aimed at the CPU cluster (which has no pc solver). This file used to omit
+    # the target and get CLUSTER by default, which the refusal now rejects --
+    # the omission was never meaningful, only unnoticed.
     store.create_job(uuid.uuid4(), None, "mm", 1.0, 12,
-                     kind=DB.PC, pcs=pcs)
+                     target=DB.CLUSTER_GPU, kind=DB.PC, pcs=pcs)
     params = _insert_params(store)
     assert params[_db_param_index(store, "kind")] == DB.PC
     assert json.loads(params[_db_param_index(store, "pcs")]) == pcs
@@ -182,7 +186,8 @@ def test_create_job_refuses_an_unknown_kind_before_writing(kind):
 def test_create_job_without_a_td_request_sends_null():
     """NULL, not {}, for the reason ``pcs`` is NULL on a cavity row."""
     store = _RecordingStore()
-    store.create_job(uuid.uuid4(), "box.obj", "mm", 1.0, 10, kind=DB.PC,
+    store.create_job(uuid.uuid4(), "box.obj", "mm", 1.0, 10,
+                     target=DB.CLUSTER_GPU, kind=DB.PC,
                      pcs={"lattice": "square"})
     assert _insert_params(store)[_db_param_index(store, "tds")] is None
 

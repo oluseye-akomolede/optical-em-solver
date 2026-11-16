@@ -27,6 +27,12 @@ if str(_COMMON_ROOT) not in sys.path:
     sys.path.insert(0, str(_COMMON_ROOT))
 import mse_common as COMMON  # noqa: E402  # also the backend NAMES, never retyped
 
+#: The Job's memory limit as a Kubernetes quantity, DERIVED from the one
+#: constant the solver also prices runs against. Retyping "14Gi" here would be
+#: the two-constants-that-must-agree defect: the app would launch a Job sized
+#: for a limit the size check never uses, and nothing would notice.
+DEFAULT_JOB_MEMORY = f"{COMMON.DEFAULT_JOB_MEMORY_BYTES // 1024 ** 3}Gi"
+
 #: The GPU backend name, taken from the module BOTH images ship.
 #:
 #: This line used to read ``import mse_backend``, to avoid retyping the literal
@@ -65,7 +71,7 @@ def job_name(job_id) -> str:
 
 def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        solver_image: str, pull_secret: str, namespace: str,
-                       cpu: str = "4", memory: str = "14Gi",
+                       cpu: str = "4", memory: str = DEFAULT_JOB_MEMORY,
                        active_deadline_seconds: int = 1800,
                        ttl_seconds_after_finished: int = 30,
                        max_tets: int | None = None,
@@ -75,6 +81,7 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
                        materials: dict | None = None,
                        graded_meshing: bool = True,
                        gpu: bool = False,
+                       kind: str | None = None,
                        gpu_product: str = "NVIDIA-RTX-A4000",
                        gpu_node: str = "gpu-node-b"):
     """Return the ``batch/v1`` Job manifest that solves one upload.
@@ -97,6 +104,13 @@ def build_job_manifest(job_id, units: str, n_index: float, n_modes: int,
         "--n-index", repr(float(n_index)),
         "--n-modes", str(int(n_modes)),
     ]
+    if kind and kind != "cavity":
+        # Appended ONLY for a non-cavity kind, so the cavity manifest stays
+        # byte-identical to what was reviewed and deployed. --kind has a
+        # default of "cavity" in the solver, so an omitted flag and an explicit
+        # one mean the same thing; the explicit form is used here so the Job's
+        # own logs and `kubectl describe` name what it ran.
+        args += ["--kind", str(kind)]
     env = [
         # Named explicitly, not left to the solver's default. This image has no
         # CUDA stack, so "cpu" is the only value that can work here -- but a
@@ -251,7 +265,7 @@ class K8sJobLauncher:
 
     def __init__(self, namespace: str, image: str, pull_secret: str,
                  gpu_image: str | None = None,
-                 cpu: str = "4", memory: str = "14Gi",
+                 cpu: str = "4", memory: str = DEFAULT_JOB_MEMORY,
                  active_deadline_seconds: int = 1800,
                  ttl_seconds_after_finished: int = 30, dry_run: bool = False,
                  max_tets: int | None = None,
@@ -290,7 +304,8 @@ class K8sJobLauncher:
                  min_feature_m: float | None = None,
                  scale: float = 1.0,
                  materials: dict | None = None,
-                 gpu: bool = False) -> dict:
+                 gpu: bool = False,
+                 kind: str | None = None) -> dict:
         if gpu and not self.gpu_image:
             raise ValueError(
                 "a GPU job needs a CUDA solver image (gpu_image), and there is "
@@ -307,6 +322,7 @@ class K8sJobLauncher:
             max_tets=self.max_tets,
             cpu_max_tets=self.cpu_max_tets,
             min_feature_m=min_feature_m, scale=scale, materials=materials,
+            kind=kind,
             # Read here, at the impure boundary, so ``build_job_manifest`` stays
             # pure: this is the app's own setting, the one ``estimate_tets``
             # priced the upload with.
@@ -464,25 +480,29 @@ class K8sJobLauncher:
         object storage by the upload, before this is called, so a Job can never
         be launched pointing at a table that has not been stored yet.
 
-        ``kind`` is a REFUSAL, not a dispatch: this launcher builds exactly one
-        Job shape, the cavity solver, and a ``kind='pc'`` row must never be
-        turned into one. ``next_queued`` already skips pc rows, so reaching here
-        with one means that filter was bypassed -- a second caller, a direct
-        call, a row whose kind changed after it was queued. Failing loudly names
-        the kind, because the alternative is a band diagram that quietly comes
-        back as a cavity solve of nothing. When ``kind`` is None the caller did
-        not say, which is every existing cavity caller; the guard is explicit
-        only about the kinds it can recognise as not-its-own.
+        ``kind`` is a DISPATCH for the GPU route and a REFUSAL elsewhere.
+        ``kind='cavity'`` (and ``None``, which is every existing cavity caller)
+        builds the cavity Job exactly as before. A ``pc`` or ``td`` kind is
+        accepted ONLY when ``gpu`` is true, i.e. when the row was created
+        ``cluster-gpu`` because the Jetson is offline; the GPU image carries
+        ``pc_solve``/``td_solve`` and the solver dispatches on ``--kind``. On
+        the CPU route a pc/td row is still refused by naming its kind: the CPU
+        image has no pc or td solver, so launching it would take the one quota
+        slot and fail after the wait. ``next_queued`` skips these rows as well,
+        so reaching here with a non-GPU one means that filter was bypassed (a
+        second caller, a direct call, a row whose kind changed after it was
+        queued).
         """
-        if kind is not None and kind != "cavity":
+        if kind is not None and kind != "cavity" and not gpu:
             raise JobLaunchError(
-                f"the cluster launcher runs cavity jobs only; it was handed "
-                f"kind={kind!r}. A pc job is solved on the Jetson worker "
-                f"(target=jetson), not here."
+                f"the CPU cluster launcher runs cavity jobs only; it was handed "
+                f"kind={kind!r}. A {kind} job is solved on the Jetson worker "
+                f"(target=jetson), or on the GPU route when the Jetson is "
+                f"offline (target=cluster-gpu), not on the CPU cluster."
             )
         manifest = self.manifest(job_id, units, n_index, n_modes,
                                  min_feature_m=min_feature_m, scale=scale,
-                                 materials=materials, gpu=gpu)
+                                 materials=materials, gpu=gpu, kind=kind)
         if self.dry_run:
             return manifest["metadata"]["name"]
         from kubernetes import client

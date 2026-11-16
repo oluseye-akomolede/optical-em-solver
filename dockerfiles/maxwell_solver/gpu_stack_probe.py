@@ -26,6 +26,41 @@ closes: it loads the cuDSS shared object itself.
 ``dlopen`` needs no GPU (it is the loader, not a kernel), so this still fails at
 build time. Only a real factorisation needs the card, and that is the lead's
 bounded-Job smoke on one A4000.
+
+Why importing, and even loading cuDSS, is STILL not enough
+---------------------------------------------------------
+A third failure reached production on 2026-11-12 (td proof job 69e3152c, image
+``mse-maxwell-solver-gpu:a24e9f7``): the solve died in ``fdtd.simulate`` at
+
+    xp.all(eps > 0)
+
+because CuPy JIT-compiles that elementwise kernel with NVRTC, and NVRTC could
+not find the CUDA headers:
+
+    RuntimeError: Failed to find CUDA headers. Please install CUDA toolkit
+    headers (e.g., pip install cupy-cuda12x[ctk]) or specify CUDA_PATH ...
+
+The image imported cupy fine and loaded cuDSS fine. Both checks passed and the
+image could not run a single kernel. ``// Dockerfile.gpu`` had already written
+the lesson down ("import cupy ... went green on an image whose first real kernel
+died") and the probe had not acted on it.
+
+``nvrtc_probe`` closes it the only way that would have caught this: it COMPILES,
+by NVRTC, with no GPU. NVRTC needs two things this base image lacked -- the
+CUDA headers (``cuda_runtime.h``) and the ``libnvrtc.so`` that ``cupy-cuda12x``
+finds through ``cuda-pathfinder`` -- and the probe fails the build if either is
+missing.
+
+The source deliberately ``#include``s ``<cuda_runtime.h>``. A bare elementwise
+kernel compiles against the headers NVRTC carries BUILT IN, so a headerless
+image would pass that probe -- tried, and it false-greened. Including a real
+header is what makes the check ask the question the GPU solve asks.
+
+Measured on 2026-11-12 in a scratch venv, both directions:
+
+* headers + libnvrtc present  -> ``NVRTC COMPILED OK`` (635 bytes of PTX)
+* the same source with no ``-I`` -> ``could not open source file
+  "cuda_runtime.h" (no directories in search list)``
 """
 
 from __future__ import annotations
@@ -96,10 +131,154 @@ def cudss_probe() -> str:
     return libs[0].name
 
 
+def _cuda_include_dirs() -> list[str]:
+    """The CUDA header directories the pip CUDA wheels install, if any.
+
+    CuPy carries no CUDA headers of its own; the ``nvidia-*-cu12`` wheels put
+    them under ``nvidia/<piece>/include`` inside site-packages, and CuPy finds
+    them through ``cuda-pathfinder`` -- which is why no fixed path is correct
+    for every install. Each ``include/crt`` is added beside its parent because
+    the headers ``#include <crt/host_defines.h>`` by that relative path.
+    """
+    dirs: list[str] = []
+    # Walk site-packages for the nvidia/*/include layout rather than guessing a
+    # distribution name per header: nvcc ships crt/, runtime ships cuda.h, and
+    # a future wheel may split them differently.
+    for dist in importlib.metadata.distributions():
+        try:
+            root = Path(dist.locate_file("nvidia"))
+        except Exception:
+            continue
+        if not root.is_dir():
+            continue
+        for inc in sorted(root.glob("*/include")):
+            dirs.append(str(inc))
+            if (inc / "crt").is_dir():
+                dirs.append(str(inc / "crt"))
+    return dirs
+
+
+def _preload_nvrtc() -> str | None:
+    """Load ``libnvrtc.so.12`` from the pip wheel by absolute path.
+
+    Returns the path loaded, or ``None`` if no such file is installed (which is
+    the image's problem, not this function's -- the caller reports it). Uses
+    ``ctypes`` rather than an environment variable because the dynamic loader
+    caches its search path at process start; see ``nvrtc_probe``.
+    """
+    for lib_dir in _cuda_library_dirs():
+        for name in ("libnvrtc.so.12", "libnvrtc.so"):
+            path = Path(lib_dir) / name
+            if path.is_file():
+                try:
+                    ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    continue
+                return str(path)
+    return None
+
+
+def _cuda_library_dirs() -> list[str]:
+    """The ``nvidia/<piece>/lib`` dirs holding libnvrtc.so / libcudart.so.
+
+    The include dirs above make NVRTC able to RESOLVE ``#include
+    <cuda_runtime.h>``; this one makes the ``libnvrtc.so.12`` shared object
+    findable at all. They are separate lookups and separate wheels (nvrtc's
+    own include is empty -- it ships only ``nvrtc.h``), and a probe that only
+    sets ``-I`` fails with "Failure finding libnvrtc.so.13 or libnvrtc.so.12".
+    """
+    dirs: list[str] = []
+    for dist in importlib.metadata.distributions():
+        try:
+            root = Path(dist.locate_file("nvidia"))
+        except Exception:
+            continue
+        if not root.is_dir():
+            continue
+        for lib in sorted(root.glob("*/lib")):
+            if lib.is_dir():
+                dirs.append(str(lib))
+    return dirs
+
+
+_NVRTC_SRC = r"""
+#include <cuda_runtime.h>
+extern "C" __global__ void mse_probe_kernel(float *a) {
+    a[threadIdx.x] = a[threadIdx.x] > 0.0f ? 1.0f : 0.0f;
+}
+"""
+
+
+def nvrtc_probe() -> str:
+    """JIT-compile a kernel to PTX with NVRTC, no GPU. Returns the PTX size.
+
+    This is the failure that reached production (see the module docstring):
+    CuPy's elementwise kernels are NVRTC-compiled, so ``import cupy`` and a
+    loaded cuDSS prove nothing about whether a solve can actually start. NVRTC
+    compilation needs no device -- it is a compiler, not a launcher -- so a bad
+    image fails HERE, at build time, instead of on the A4000 after a deploy.
+
+    ``compute_86``/``sm_86`` is the A4000 (GA104). Compiling for an explicit
+    arch rather than ``compute_XX`` detected from a device matters: there is no
+    device at build time, and a probe that needed one could not run here.
+    """
+    try:
+        from cupy_backends.cuda.libs import nvrtc
+    except Exception as exc:  # noqa: BLE001 -- any load failure is the finding
+        raise AssertionError(
+            "this GPU image cannot JIT-compile a CuPy kernel: the NVRTC library "
+            f"is not loadable ({exc}). cupy-cuda12x needs a libnvrtc.so.12 on a "
+            "machine with no CUDA toolkit; pin nvidia-cuda-nvrtc-cu12 in "
+            "requirements-gpu.txt."
+        ) from exc
+
+    include_dirs = _cuda_include_dirs()
+    if not include_dirs:
+        raise AssertionError(
+            "this GPU image cannot JIT-compile a CuPy kernel: no CUDA headers are "
+            "installed (no nvidia/*/include under site-packages), and NVRTC needs "
+            "cuda_runtime.h. Pin nvidia-cuda-runtime-cu12 and "
+            "nvidia-cuda-nvcc-cu12 in requirements-gpu.txt."
+        )
+
+    # Headers are only half of it. libnvrtc.so.12 lives beside them under
+    # site-packages/nvidia/cuda_nvrtc/lib, and cuda.pathfinder does NOT search
+    # there: measured on this VM, with the headers present and findable, cupy
+    # still failed with `Failure finding "libnvrtc.so.13 or libnvrtc.so.12"`.
+    #
+    # Setting LD_LIBRARY_PATH here does NOT work -- the dynamic loader reads it
+    # once at process start, so assigning os.environ is inert (measured: the
+    # same failure with the variable set in-process, success only when it was
+    # exported BEFORE the interpreter started). Preloading the shared object by
+    # absolute path with RTLD_GLOBAL does work, because the loader then finds
+    # it already loaded: 695 bytes of PTX, no GPU. Done here so the probe tests
+    # the wheels the image installs, not whatever the caller's shell exported.
+    _preload_nvrtc()
+
+    program = nvrtc.createProgram(_NVRTC_SRC, "mse_probe_kernel.cu", (), ())
+    options = tuple("-I" + d for d in include_dirs) + ("-arch=compute_86",)
+    try:
+        nvrtc.compileProgram(program, options)
+        ptx = nvrtc.getPTX(program)
+    except Exception as exc:  # noqa: BLE001
+        log = ""
+        try:
+            log = nvrtc.getProgramLog(program)
+        except Exception:
+            pass
+        raise AssertionError(
+            "this GPU image cannot JIT-compile a CuPy kernel -- NVRTC failed. "
+            "This is the fdtd.simulate `xp.all(eps > 0)` failure, caught at "
+            f"build time. ({exc})\nNVRTC log:\n{log}"
+        ) from exc
+    return f"{len(ptx)} bytes of PTX"
+
+
 def main() -> int:
     import_probe()
     print("GPU STACK IMPORTS OK")
     print("cuDSS LOADS OK: " + cudss_probe())
+    print("NVRTC COMPILES OK: " + nvrtc_probe())
     return 0
 
 

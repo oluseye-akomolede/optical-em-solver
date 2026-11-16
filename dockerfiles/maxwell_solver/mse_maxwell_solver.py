@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import resource
 import sys
@@ -175,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "grows with the part count. Absent means the "
                              "one-part vacuum path.")
     parser.add_argument("--quiet", action="store_true", help="less progress logging")
+    parser.add_argument(
+        "--kind", default="cavity", choices=("cavity", "pc", "td"),
+        help="which solve this Job runs (default: cavity). 'pc' and 'td' are "
+             "the photonic-band and time-domain uploads, translated by the "
+             "ported worker modules; they read and write a single job JSON "
+             "under --local-in/--local-out and ignore the mesh options.")
     return parser
 
 
@@ -229,6 +236,144 @@ def make_store(local_root: str | None, job_id: str) -> STORE.ObjectStore:
     if local_root:
         return STORE.LocalStore(local_root)
     return STORE.S3Store()
+
+
+def _run_worker_kind(args) -> int:
+    """Run a pc or td job: the worker's translation layer, on the A4000.
+
+    The two worker modules were written for the Jetson and are the ONLY place
+    that turns a stored request into a solver call and a result into the dict
+    the page reads. They are copied into this image unchanged (see
+    ``worker_port`` tests) rather than re-implemented, so a pc job solved here
+    and a pc job solved on the Jetson produce the same payload by construction
+    rather than by two people agreeing.
+
+    What this function adds is only what the cluster needs and the Jetson gets
+    from its service: the object store, the job row, peak-RSS logging, and the
+    same plain-sentence failure the cavity path produces. It does NOT touch the
+    mesh options -- ``--units``, ``--n-modes`` and the rest are meaningless for
+    a lattice or an FDTD grid, and reading them here would be a second place
+    for a job to be misconfigured.
+    """
+    job_id = str(args.job_id)
+    verbose = not args.quiet
+    db = None
+    store_in = store_out = None
+    try:
+        store_in = make_store(args.local_in, job_id)
+        store_out = make_store(args.local_out or args.local_in, job_id)
+        if not (args.local_in or args.local_out):
+            db = mse_db.JobStore()
+            db.connect()
+
+        job = _load_worker_job(store_in, job_id)
+
+        if args.kind == "pc":
+            # solve_pc is pure translation: lazily imports pc.py, returns a
+            # JSON-ready dict, does no I/O of its own.
+            from pc_solve import solve_pc
+            payload = solve_pc(job)
+        else:
+            # td stages field output, so it needs the store, and it carries
+            # its own OOM detection. Passing its objects through unchanged
+            # keeps the "Jetson busy"/OOM sentence identical on both routes.
+            from td_solve import solve_td
+            payload = solve_td(job, store_in, store_out)
+
+        if verbose:
+            print(f"[mse] {args.kind} solve done: {sorted(payload)}", flush=True)
+        _report_worker_result(db, store_out, job_id, args.kind, payload)
+    except BaseException as exc:  # noqa: BLE001 - record, then exit non-zero
+        print(f"[mse] FAILED: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        rss = peak_rss_mb()
+        print(f"[mse] peak RSS {rss:.0f} MB", flush=True)
+        if db is not None:
+            db.fail(job_id, owner_message(exc), peak_rss_mb=rss)
+        return 1
+    finally:
+        if db is not None:
+            db.close()
+    return 0
+
+
+def _load_worker_job(store_in, job_id: str) -> dict:
+    """The claimed job's row as the worker modules expect it.
+
+    ``solve_pc`` reads ``job["pcs"]``; ``solve_td`` reads ``job["tds"]``. Both
+    raise their own typed error naming the missing object, which is what
+    reaches the owner, so this loads the row and hands it over rather than
+    re-validating the request in a second place.
+    """
+    raw = store_in.read(f"jobs/{job_id}/job.json")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    return json.loads(raw)
+
+
+def _json_safe(value):
+    """A JSON-encodable copy of a worker payload.
+
+    ``solve_pc`` returns plain lists; ``solve_td`` returns numpy arrays in
+    ``payload["result"]`` (its probe traces). The page does not read those from
+    here -- td's real output is ``trace.bin``/``spectrum.json``, written to the
+    store by ``write_results`` -- but the payload still has to be encodable to
+    record the run. Arrays become lists, and anything else JSON cannot hold is
+    reduced to its repr rather than crashing the Job after the solve is done.
+
+    Non-finite floats become ``None``. ``json.dumps`` emits bare ``NaN`` and
+    ``Infinity`` for them by default, which is NOT valid JSON: the run record
+    would be written and then rejected by any strict reader, which is the same
+    finished-solve-thrown-away failure as the raw ``json.dumps`` this replaced.
+    A diverged td run is exactly when a nan arrives, so a lenient document here
+    would hide the divergence in the one record that should show it. ``None``
+    says "this number is not a number" in JSON that every reader can parse.
+
+    numpy scalars are caught on the way out (``np.float32("nan")`` is not
+    ``float``); with ``numpy>=2`` the same holds for ``np.float64``, which is no
+    longer a ``float`` subclass.
+    """
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "tolist") and callable(value.tolist):
+        return _json_safe(value.tolist())
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, np.floating):
+        f = float(value)
+        return f if math.isfinite(f) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return repr(value)
+
+
+def _report_worker_result(db, store_out, job_id, kind, payload) -> None:
+    """Write the result where the app reads it, and mark the row done.
+
+    The payload is recorded at ``jobs/<id>/result.json`` in a JSON-safe form.
+    That key is what the cavity path writes, but it is NOT what the page reads
+    for a td job: ``web/app.py`` fetches ``spectrum.json`` and ``trace.bin``,
+    which ``solve_td`` has already written to the store via
+    ``write_results``. For td this file is the run record, not the product.
+    ``solve_td`` returns numpy arrays, so encoding it needs ``_json_safe`` --
+    see the td dispatch test, which caught the raw ``json.dumps`` crashing
+    every real td Job AFTER the solve had finished.
+
+    The row is completed through the same ``set_stage`` the cavity path uses;
+    a run with no database (``--local-in``) just writes the file, which is
+    what a test does.
+    """
+    store_out.write(f"jobs/{job_id}/result.json",
+                    json.dumps(_json_safe(payload), sort_keys=True).encode("utf-8"))
+    if db is not None:
+        db.set_stage(job_id, "done", stage=kind, peak_rss_mb=peak_rss_mb())
+
 
 
 def solve(job_id: str, units: str, n_index: float, n_modes: int,
@@ -876,6 +1021,14 @@ def owner_message(exc: BaseException) -> str:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+
+    # pc and td are different solvers with different inputs; they share this
+    # Job, the object store, the database row and the failure message, and
+    # nothing else. Dispatch before ANY mesh option is read, so a pc/td run
+    # never resolves max_tets, never parses --units, and cannot be
+    # half-configured by flags that do not apply to it.
+    if args.kind in ("pc", "td"):
+        return _run_worker_kind(args)
 
     # keep the resolution rule in one place
     if args.epw is not None:

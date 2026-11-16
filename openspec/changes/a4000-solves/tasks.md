@@ -149,3 +149,176 @@ boundary where the Job is created.
 a non-root mutation proves nothing): with `nvidia-cudss-cu12` uninstalled the probe exits 1
 with "no nvidia-cudss-cu12 distribution ..."; with `nvmath-python` uninstalled it fails with
 "'nvmath' is not importable". The intact image prints both OK lines and exits 0.
+
+## 6. pc and td uploads on the A4000 (Jetson offline, 2026-11-12)
+
+**Context.** The Jetson is offline, so `photonic-bands` (pc) and `time-domain`
+(td) uploads have no route. This section gives them one WITHOUT touching the
+existing `mesh` FEM path, whose `--local-in`/`--local-out` contract and
+`_write_results` DB path already work on the cluster and must keep working.
+
+**Why not route pc/td through the FEM container.** `spark-fem-solver.py` solves
+an eigenproblem on a tetrahedral mesh of an uploaded solid. pc is a
+plane-wave-expansion band solve on a lattice, td is an FDTD march on a grid;
+neither has a mesh, a stiffness matrix or a mode list, and both solvers already
+exist in `dockerfiles/maxwell_solver/` (`pc.py`, `fdtd.py`, `fdtd_layout.py`)
+and are ALREADY IN the GPU image. What is missing is only the translation layer
+in `worker/` (`pc_solve.py`, `td_solve.py`): validation plus params->solver-call
+plus solver-result->result-dict. Port that layer into the GPU image and call it
+from a small entry point with the same `--local-in`/`--local-out` contract the
+FEM container uses.
+
+**The two layers are not the same shape, and the port must keep the difference.**
+`worker/pc_solve.py::solve_pc(job, *, solver=None)` is pure translation: it
+imports the solver lazily and returns a JSON-ready dict (`lattice`,
+`polarisation`, `labels`, `k_points`, `bands`) with no I/O at all.
+`worker/td_solve.py::solve_td(job, store_in, store_out=None, ...)` takes the
+object store, because an FDTD run stages field output; it has its own OOM
+detection (`is_out_of_memory`, `oom_message`) and an isolated child-process path
+(`solve_td_isolated`). The pc port is a copy. The td port must also carry its
+storage handles, and its OOM sentence, rather than being flattened into the pc
+shape.
+
+```mermaid
+flowchart LR
+  A[upload + params] --> B[MSE_GPU_ROUTE=cluster]
+  B --> C[cluster-gpu Job: A4000]
+  C --> D[entry.py: kind=pc|td]
+  D --> E[worker logic ported into image]
+  E --> F[pc.py / fdtd.py solver]
+  F --> G[result JSON]
+  G --> H[_write_results DB path - unchanged]
+  B -.->|jetson| I[Jetson bench - offline]
+```
+
+**Constraints this section inherits and does not change.**
+- The one-Job quota slot holds until raised by the lead (5.1); this section adds
+  no second Job type to a live quota.
+- No change to the `mesh` branch of `entry.py`; the CPU-cluster manifest is
+  untouched.
+- Bounded: the GPU manifest's cpu/memory limits stay as reviewed in 4.1/4.2;
+  pc/td must fail with a plain sentence on OOM like the FEM path does (4.5).
+
+### 6.1 OpenSpec first (this commit)
+
+- [x] 6.1.1 Record the design above in this change, and amend the
+      `photonic-bands` requirement that pc "SHALL run on the Jetson worker only,
+      and the cluster SHALL refuse it". That wording is now wrong when the
+      Jetson is offline. Scope checked: `time-domain` has NO routing requirement
+      of its own -- td's cluster refusal lives in `web/db.py::next_queued`'s
+      `kind = 'cavity'` whitelist and in `web/jobs.py::create`'s refusal -- so
+      there is no td spec requirement to amend and none is invented here.
+
+### 6.2 The entry point (landed: `--kind` on the solver itself)
+
+The entry point is `dockerfiles/maxwell_solver/mse_maxwell_solver.py`, NOT an
+`entry.py` -- there is no such file in this image, and 6.2.1 below originally
+named one. Corrected here after reading the tree.
+
+- [x] 6.2.1 `mse_maxwell_solver.py` gains `--kind` = `cavity` | `pc` | `td`,
+      defaulting to `cavity` so every Job launched before the flag existed is
+      unchanged. The dispatch is the FIRST thing `main()` does, before
+      `max_tets()` is resolved and before `--units`/`--n-modes` are read, so a
+      pc/td run cannot be half-configured by flags that do not apply to it.
+- [x] 6.2.2 `worker/pc_solve.py` and `worker/td_solve.py` copied into the GPU
+      image UNCHANGED (`COPY worker/<f>.py /opt/app/`), not re-implemented, so
+      both routes run the same translation by construction. td keeps its
+      `store_in`/`store_out` handles and its `solve_td_isolated` child path;
+      pc takes the injectable-solver form. Neither pulls a new dependency in
+      at module scope (`pc_solve` is stdlib-only; `td_solve` needs numpy, and
+      imports `pc`/`fdtd`/`fdtd_layout`/`mse_common`/`mse_parts` lazily from
+      the image tree, all five of which ship there).
+- [x] 6.2.3 A plain sentence on failure: `_run_worker_kind` runs
+      `owner_message(exc)` exactly as the cavity path does, records
+      `db.fail(...)` with the peak RSS, and exits non-zero. It deliberately
+      does NOT write `result.json` on failure -- an empty result file would be
+      read by the page as a successful solve of nothing.
+
+### 6.3 Tests (tier 1 only)
+
+- [x] 6.3.1 `tests/test_worker_kind_dispatch.py::test_kind_pc_dispatches_to_the_worker_module_and_writes_result`
+      -- a pc `--local-in`/`--local-out` round trip produces the result keys
+      the Jetson path produces. The solver is a stub with `pc.bands_from_mesh`'s
+      exact signature, so a wrong call is not silently accepted.
+- [x] 6.3.2 `test_a_malformed_pc_request_fails_loudly_and_writes_no_result`
+      -- the failure shape, which is the half the Jetson path gets from its
+      service and this path has to build.
+- [x] 6.3.3 `test_kind_cavity_still_takes_the_mesh_path` and
+      `test_the_cavity_manifest_is_byte_identical_after_the_kind_dispatch`
+      -- the FEM path is unchanged, asserted on the manifest byte-for-byte
+      rather than on "it did not raise".
+- [x] 6.3.4 Mutation-proved, not just passed: with the dispatch restored to
+      `if False:` both 6.3.1 and the mesh-option test fail; with the dispatch
+      moved BELOW the `max_tets()` resolution, `test_a_pc_job_ignores_every_mesh_option`
+      fails on `assert 7 == 600000` -- a pc job leaking its cap into the
+      process-wide global that every later cavity solve inherits.
+- [x] 6.3.5 `test_kind_td_dispatches_to_the_worker_module_and_writes_result`
+      -- the td half, deliberately NOT stubbed. It reuses
+      `tests/test_td_solve.py`'s own tiny job (`_job`/`_Store`) and drives it
+      through `--kind td`, so it is evidence for the PORT (the module is
+      reachable from the image path, its store handles are passed correctly,
+      its payload encodes) rather than the wiring.
+- [x] 6.3.6 **This test found a bug in the code it was testing.** `solve_td`
+      returns numpy arrays in `payload["result"]` (the probe traces), and
+      `_report_worker_result` passed the payload straight to `json.dumps`.
+      Every real td Job on the A4000 would have solved the whole simulation and
+      THEN crashed writing the result. Fixed with `_json_safe` (arrays become
+      lists; anything else JSON cannot hold is reduced to `repr` rather than
+      killing a finished solve). Mutation-proved: restoring the raw
+      `json.dumps(payload)` fails 6.3.5 with
+      `TypeError: Object of type ndarray is not JSON serializable`.
+      A stub-based td test, as first proposed, would have missed this entirely
+      -- the stub would have returned plain JSON-shaped values.
+- [x] 6.3.7 The `_report_worker_result` docstring claimed `result.json` is
+      "the same key the Jetson route writes" and the page "needs no branch".
+      That is false for td: `web/app.py` reads `spectrum.json` and `trace.bin`
+      for a td job, which `solve_td` already writes to the store itself via
+      `write_results`. For td, `result.json` is the run record, not the
+      product. Corrected in place.
+
+### 6.4 The td route (found by the reviewer's read of 6.2)
+
+- [x] 6.4.1 `web/db.py`: a td row was hardcoded to the Jetson in TWO places --
+      `create_job`'s target refusal (which raised for any target but jetson) and
+      `next_queued`'s kind whitelist (which was already kind-and-target pair
+      based). Fixing only the first would have been worse, not better: the
+      handler would then create a `cluster-gpu` td row that the queue still
+      refused to see, and the owner's upload would sit in a queue nothing reads.
+      The refusal is now on the PAIR: any GPU kind on the CPU `cluster` target
+      raises, both GPU targets are accepted. `GPU_KINDS` names the set once so
+      the two sites cannot drift.
+- [x] 6.4.2 Both upload handlers already routed pc and td through the same
+      `_gpu_target()` helper, but it had no test that drove it through the real
+      upload for td. `test_a_td_upload_is_routed_by_the_setting_not_by_a_hardcoded_machine`
+      runs the form four times (unset, `cluster`, `jetson`, nonsense) and checks
+      the row's target each time.
+- [x] 6.4.3 The abandoned-GPU reroute: a pc/td row now moves to `cluster-gpu`
+      when the route says cluster, and stays put when the route says jetson.
+      The owner's message names the queue it actually moved to; the old text
+      said "the cluster queue" for every kind.
+- [x] 6.4.4 Spec delta written for `time-domain`. The requirement said a td job
+      "SHALL never be routed to the cluster" as a flat rule -- true when the
+      Jetson was the only machine with a td solver, false now. It now says the
+      route decides, and the refusal is on the (kind, target) pair.
+
+**A test that pinned the old contract was updated, not deleted:**
+`test_a_td_form_queues_a_jetson_td_row...` asserted `target == jetson`
+unconditionally, which is exactly the hardcoding 6.4.1 removed. It now asserts
+the target is one of the two GPU targets and the ROUTE MATRIX test pins which.
+Its row-contents assertions (the worker's own reader and layout accept the
+stored request) are unchanged and route-independent.
+
+**Mutation-proved:** hardcoding `_gpu_target()` back to `return DB.JETSON`
+fails three of the four route cases (`cluster`, unset, nonsense) and passes the
+jetson one -- so the test fails for the reason it names, not for a reason common
+to all four.
+
+**Still not proved by these tests, and must not be implied:** that the GPU
+image builds, that `pc.py`/`fdtd.py` solve correctly at production size, that a
+pod schedules onto the A4000, and that a real pc upload returns a correct band
+diagram. pc is driven through a stub solver, so that half proves the WIRING.
+td runs a real (tiny, VM-sized) solve, so it proves the PORT but says nothing
+about device scale. The image build and the A4000 smoke are the lead's (5.x).
+
+**Not in this section.** The image rebuild and push, the quota raise, and the
+smoke on a real A4000 pod: all the lead's (5.x). This seat commits and hands up.

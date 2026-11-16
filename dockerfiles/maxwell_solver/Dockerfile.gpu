@@ -16,10 +16,17 @@
 #
 # THE -runtime VARIANT carries the math libraries (cuBLAS/cuSPARSE/cuSOLVER)
 # the factorisation links against, and deliberately not the Toolkit headers or
-# nvcc: nothing on the solver's GPU path compiles C at run time. cuDSS and
-# nvmath ship as wheels in requirements-gpu.txt, not through the base image,
-# because that is how the Jetson worker gets them and two sources of truth for
-# a library version is how a solve that works on one machine fails on another.
+# nvcc: nothing on the solver's GPU path compiles C with nvcc at run time. It
+# DOES JIT-compile with NVRTC -- CuPy's elementwise kernels are the solve's
+# innermost loop, and `xp.all(eps > 0)` is the first of them -- so the headers
+# and libnvrtc that NVRTC needs come from the pip wheels in
+# requirements-gpu.txt, pinned to this base's 12.6 line rather than from the
+# base. That distinction cost a live td job on 2026-11-12: the comment here
+# said "nothing compiles C", which was true of nvcc and false of cupy.
+# cuDSS and nvmath ship as wheels in requirements-gpu.txt, not through the base
+# image, because that is how the Jetson worker gets them and two sources of
+# truth for a library version is how a solve that works on one machine fails on
+# another.
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
 
 ENV PYTHONUNBUFFERED=1 \
@@ -68,6 +75,15 @@ RUN pip install --no-cache-dir -r /opt/app/requirements.txt \
     && pip install --no-cache-dir -r /opt/app/requirements-gpu.txt
 
 COPY dockerfiles/maxwell_solver/ /opt/app/
+
+# The worker's pc/td translation layer, copied UNCHANGED from worker/ so the
+# Jetson route and the A4000 route run the same code rather than two people's
+# agreeing versions. They are standard-library-only at module level
+# (pc_solve imports pc at call time, td_solve imports the solver lazily), so
+# they add no dependency to this image. Copied AFTER the app tree so a change
+# here does not invalidate the layer above.
+COPY worker/pc_solve.py /opt/app/pc_solve.py
+COPY worker/td_solve.py /opt/app/td_solve.py
 
 # THE CHECK, at build time, with no GPU present. This is the lesson
 # ./Dockerfile.bench-cuda paid for: `import cupy` needs neither a GPU nor the

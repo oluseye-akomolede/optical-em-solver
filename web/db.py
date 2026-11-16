@@ -71,11 +71,15 @@ GPU_TARGETS = (CLUSTER_GPU,)
 #: be the default today".
 CAVITY = "cavity"
 PC = "pc"
-#: ``td`` is a 3-D time-domain (FDTD) run of the upload. It runs on the Jetson
-#: GPU and nowhere else: the cluster has no FDTD solver, so like ``pc`` it must
-#: never reach the cluster launcher. Its request lives in ``tds``.
+#: ``td`` is a 3-D time-domain (FDTD) run of the upload. Its request lives in
+#: ``tds``.
 TD = "td"
 KINDS = (CAVITY, PC, TD)
+
+#: The kinds that need a GPU wherever they run. Named as a set so the two places
+#: that ask "is this a GPU-only kind?" -- ``create``'s target refusal and
+#: ``next_queued``'s target gate -- cannot drift apart.
+GPU_KINDS = (PC, TD)
 
 #: How many times a jetson job may be handed back with no verdict before it is
 #: failed for good. Releases are legitimate for transient reasons; an unbounded
@@ -362,14 +366,17 @@ class JobStore:
             # kind and the worker would fail it minutes later. Refused here,
             # before the row exists.
             raise ValueError(f"unknown job kind {kind!r}; expected one of {KINDS}")
-        if kind == TD and target != JETSON:
-            # A td job runs only on the Jetson worker; the cluster has no
-            # time-domain solver. Refused before the row exists, so no later
-            # path has to rescue a td row created on the wrong queue. (pc rows
-            # are not refused here: tests/pc_routing_check.py builds a cluster
-            # pc row on purpose to prove next_queued cannot see one.)
-            raise ValueError(f"a td job runs on the Jetson only; target "
-                             f"{target!r} is not {JETSON!r}")
+        if kind in GPU_KINDS and target == CLUSTER:
+            # A pc or td job runs on a GPU: the Jetson worker, or the
+            # cluster-gpu Job whose image carries pc_solve/td_solve (owner
+            # 2026-11-12, while the Jetson is offline). It is refused for the
+            # CPU CLUSTER target only -- that image has neither solver, so the
+            # row would take the one quota slot and fail after the wait.
+            # ``cluster-gpu`` is accepted for both kinds now; before the
+            # cluster route existed this refused every td target but jetson.
+            raise ValueError(f"a {kind} job runs on a GPU, not the CPU "
+                             f"cluster; target {target!r} must be "
+                             f"{JETSON!r} or {CLUSTER_GPU!r}")
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO mse.jobs "
@@ -428,7 +435,8 @@ class JobStore:
                 (RUNNING, "meshing", k8s_job_name, str(job_id)),
             )
 
-    def reroute_to_cluster(self, job_id, reason: str) -> bool:
+    def reroute_to_cluster(self, job_id, reason: str,
+                           gpu_route: str = "jetson") -> bool:
         """Move a jetson job back to the cluster queue. Returns whether it moved.
 
         This is the fallback for a GPU that never came: the job's estimate put it
@@ -442,22 +450,39 @@ class JobStore:
         cannot be yanked out from under it. Returns False when nothing moved,
         which is not an error: it means someone else got there first.
 
-        Also guarded on ``kind = 'cavity'``, and that guard is load-bearing.
-        The cluster launcher builds exactly one Job shape -- the cavity solver
-        -- so a pc row moved to the cluster would be cavity-solved, its band
-        diagram never produced, and (because ``next_queued`` skips pc rows and
-        ``claim_jetson`` only sees ``target = 'jetson'``) the row would be
-        invisible to BOTH queues: stranded, with no error anywhere. There is no
-        cluster pc path in this change, so a pc row STAYS on the GPU queue,
-        where its worker may still come. The guard is in the SQL, not only in
-        the caller, so no caller can strand one.
+        **WHERE it lands depends on the kind**, and both destinations are in the
+        same UPDATE so there is no window where a row sits on a target that can
+        see it but not solve it:
+
+        * a cavity row goes to ``cluster`` -- the CPU Job that has always taken
+          it;
+        * a pc or td row goes to ``cluster-gpu`` when ``gpu_route`` is
+          ``cluster``, because the CPU image has neither solver. This covers the
+          rows already stuck on ``target='jetson'`` when the Jetson went
+          offline: nothing is coming to claim them, so they are moved to the
+          machine that can actually run them rather than waiting forever.
+        * a pc or td row with ``gpu_route='jetson'`` is NOT moved. The Jetson is
+          the configured GPU machine, so its worker may still come, and moving
+          the row to a destination the route says is not in use would be a
+          second, contradicting policy.
+
+        The kind guard is in the SQL, not only in the caller, so no caller can
+        send a pc/td row to the CPU cluster. ``gpu_route`` is a parameter rather
+        than read from the environment here because this module does not own
+        configuration; the caller passes ``CFG.gpu_route()``.
         """
+        gpu_target = CLUSTER_GPU if gpu_route != "jetson" else None
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "UPDATE mse.jobs SET target = %s, stage = %s, message = %s, "
+                "UPDATE mse.jobs SET target = CASE WHEN kind = %s THEN %s "
+                "ELSE %s::text END, "
+                "stage = %s, message = %s, "
                 "lease_owner = NULL, lease_expires_at = NULL, gpu_queued_at = NULL "
-                "WHERE job_id = %s AND target = %s AND status = %s AND kind = %s",
-                (CLUSTER, QUEUED, reason, str(job_id), JETSON, QUEUED, CAVITY),
+                "WHERE job_id = %s AND target = %s AND status = %s AND "
+                "(kind = %s OR (kind = ANY(%s) AND %s::text IS NOT NULL))",
+                (CAVITY, CLUSTER, gpu_target,
+                 QUEUED, reason, str(job_id), JETSON, QUEUED,
+                 CAVITY, list(GPU_KINDS), gpu_target),
             )
             return cur.rowcount > 0
 
@@ -665,13 +690,16 @@ class JobStore:
         slot while the app waited for a GPU worker that is not coming. Jetson
         rows are claimed by the worker API instead -- see ``claim_jetson``.
 
-        Filtered by kind as well, and this is not belt-and-braces. The cluster
-        has no pc or td solver: ``launcher.create`` refuses any kind but cavity,
-        so a ``kind='pc'`` or ``'td'`` row reaching here would be failed at
-        launch instead of waiting for the Jetson. The kind filter is what makes
-        the cluster queue unable to see such a row at all, independent of which
-        target the row carries. It is a WHITELIST (``kind = 'cavity'``), so a
-        kind added later is invisible here until a cluster solver exists for it.
+        Filtered by kind as well, and this is not belt-and-braces. A pc or td
+        row is visible ONLY on ``cluster-gpu``, never on the CPU ``cluster``
+        target: the CPU image has no pc/td solver, so such a row would take the
+        one quota slot and fail at launch. The gate is on the (kind, target)
+        PAIR, so it holds whichever way a row was created and whatever a caller
+        passes as ``targets``.
+
+        It is a WHITELIST: a cavity row on any Job target, a pc/td row on
+        ``cluster-gpu`` only, and a kind added later is invisible until someone
+        states which route it can take.
         """
         if isinstance(targets, str):
             targets = (targets,)
@@ -679,9 +707,10 @@ class JobStore:
             cur.execute(
                 "SELECT job_id, original_filename, units, n_index, n_modes, est_tets, "
                 "min_feature_m, scale, materials, kind, target "
-                "FROM mse.jobs WHERE status = %s AND target = ANY(%s) AND kind = %s "
+                "FROM mse.jobs WHERE status = %s AND target = ANY(%s) AND "
+                "(kind = %s OR (kind = ANY(%s) AND target = %s)) "
                 "ORDER BY created_at LIMIT 1",
-                (QUEUED, list(targets), CAVITY),
+                (QUEUED, list(targets), CAVITY, list(GPU_KINDS), CLUSTER_GPU),
             )
             row = cur.fetchone()
         if not row:

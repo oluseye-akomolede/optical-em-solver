@@ -985,6 +985,86 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
       (n_i is a figure vs temperature; the fetched `SiC/electric.html` has no tabulated
       mobility or lifetime).
 
+      **Second-source pass, @181d9cb (2026-11-11): 3 of the 11 filled, 4 reclassified as
+      REFUSED, 4 left as retrieval gaps ending in a deliberate refusal.** Every one is
+      now either cited or refused with a stated reason, so the row's "done" condition is
+      MET; the `xfail` does NOT flip, because 8 parameters are still absent from the
+      library (see below -- the xfail and the refusal are different questions).
+
+      - **SiC n_i/mu_e/mu_h filled** from NASA Table 5.1 and TU Wien Table 2.3; all
+        explicitly 4H-SiC. `mu_e = 800`, `mu_h = 115 cm^2/(V s)` at 10^16 cm^-3 doping,
+        both from NASA. The columns are named, not positional.
+      - **n_i RESOLVED by derivation, not by choosing a source (`f8f8f87`, figures
+        corrected in the comment at the reviewer's request).** The first pass took NASA's
+        ~1e-7 over TU Wien's 5e-9, reasoning that NASA labels the table "at 300 K". The
+        review asked for the figure to be checked on its merits, and the arithmetic
+        settles it: `n_i = sqrt(Nc*Nv)*exp(-Eg/2kT)` with Eg(4H) = 3.26 eV and T = 300 K
+        gives **1.04e-8 cm^-3 even at m\* = m_0** (an impossible maximum), which is 9.6x
+        *below* 1e-7. Over the plausible masses (m_e\* 0.2-0.37, m_h\* 0.4-0.82) the range
+        is **1.56e-9 to 4.25e-9**, bracketing TU Wien's 5e-9. The library now carries
+        **5e-9**.
+      - **Two different Eg drops, both correct, not interchangeable.** To reach 1e-7 from
+        the table's 5e-9 at fixed masses needs Eg lower by `2kT*ln(20) = 0.155 eV`
+        (Eg = 3.105 eV). To reach it from the computed ceiling 1.04e-8 needs `0.117 eV`
+        (Eg = 3.143 eV). An earlier draft quoted one drop and attributed it to the other
+        comparison; the reviewer caught it.
+      - **What the arithmetic does NOT support: "NASA's cell is a 6H number."** 6H's gap
+        is ~3.02 eV, so 3.10-3.14 eV sits ~0.12 eV *above* 6H and ~0.12 eV *below* 4H --
+        neither polytype. The honest reading is plain mis-scaling, and that is what the
+        note now says. The first draft of this entry claimed the 6H connection, which the
+        numbers do not license.
+      - **TU Wien Table 2.3 states no temperature** (lead's source check). Its Eg 3.26 is
+        described there as from liquid-He photoluminescence, i.e. low temperature, while
+        the field name `n_i_300K` asserts 300 K. So 5e-9 is recorded as *the table's
+        value*, and the 300 K arithmetic above is stated as conditional on both sources
+        meaning ~300 K. The note does not put "300 K" into a source that never said it.
+      - **TU Wien's 6H value (1.6e-6)** is high by ~3-5x against the same calc at Eg=3.02
+        (3.1e-7 to 6.4e-7) but the same ORDER -- consistent with a fitted table, which is
+        why its 4H cell is trusted over NASA's on arithmetic alone.
+      - **The error direction mattered:** the first pass's ~20x error was on the side of
+        the *larger* number, which would have put 10x too many intrinsic carriers in every
+        4H solve.
+      - **The trap to remember: "the table states 300 K" is a provenance fact, not a
+        correctness fact.** It decided which cell to read, and I treated that as settling
+        which cell was right. A label on a cell says what the author intended; it does not
+        make the number possible.
+      - **A recorded polytype MISMATCH, not silently mixed.** The library's SiC `eps_s`
+        is 6H-ordinary (9.66, Ioffe's "usually used" value) while the new n_i/mu are 4H.
+        `mu_e` is also ANISOTROPIC (parallel-to-c 800, perpendicular 60, a 13x spread) and
+        the entry records 800 because a tet mesh has no c-axis convention. Both are
+        flagged in the entry's notes; neither is averaged away.
+      - **The ~20x 4H n_i disagreement is RESOLVED -- see the derivation above.** TU Wien's
+        5e-9 is the physically possible value and is now in the library; NASA's 1e-7 is
+        above the computed ceiling at 300 K. The conflict is no longer "unresolved between
+        two sources": one source is wrong.
+      - **Si tau_e/tau_h and SiC tau_e/tau_h are REFUSED, not pending.** TU Wien node72
+        is quotable: "There are no reliable experimental data available to extract the
+        corresponding parameters for a-SiC", and it proposes substituting Si lifetimes --
+        an admission that no SiC number exists to read. For Si the reason is separately
+        normative: a lifetime is the SAMPLE's property (doping, defects, process), not
+        the material's, so the library must not carry one. DEVSIM's
+        `CreateSiliconDriftDiffusionAtContact` hard-codes equilibrium carrier densities
+        and exposes no surface recombination velocity, so a lifetime is not load-bearing
+        on the current path either.
+      - **Au/Ag eps_s REFUSED:** a metal has no static permittivity; it is a conductor
+        (contact or equipotential). Optical frequency-dependent metal permittivity is a
+        separate library, out of scope.
+      - **Al2O3/HfO2 eps_s stay RETRIEVAL GAPS**, so they keep their own meaning: a
+        quantity that exists and waits on a dielectric handbook. Mixing them into
+        REFUSED would say retrieval can never succeed, which is false.
+      - **`REFUSED` is DERIVED from the entries**, not a second hand-typed list. The first
+        mutation attempt edited the hand list and silently passed -- because the hand list
+        no longer existed and the mutation matched nothing. Same failure mode as the
+        earlier anchor-string miss, and the reason the derivation is worth it.
+      - **`resolve()` has ONE guard for absence, not two.** Two were written first (a
+        REFUSED loop and an NaN check); mutated separately, each passed alone, which
+        proved them redundant rather than complementary. Collapsed to the NaN check, which
+        now names the KIND of absence. Mutation: disabling it fails
+        `test_a_metal_cannot_be_used_as_a_dielectric`. An override is always honoured --
+        refusing it too would turn "we will not guess" into "you cannot model gold".
+      - Tests: 18 passed, 1 xfailed in `tests/test_materials_library.py`; 96 passed,
+        4 skipped, 1 xfailed on the affected set.
+
       `require_cited` stays `xfail(strict=True)`. `test_the_gap_is_what_the_xfail_claims_it_is`
       now pins the IDENTITY of the 11 remaining (material and parameter), compared against
       `gaps()`, so filling one requires editing the expectation and inventing one fails it.
@@ -1022,13 +1102,200 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
      post-mutation result.
 - [ ] 2.3 Axisymmetric (r, z) form with the 2πr weight; the abrupt-junction V_bi, depletion
       width and cylinder-area checks.
-- [ ] 2.4 Ideal-diode slope, current conservation, the Debye-length refusal, and the
-      multi-terminal check (three doped regions, four ohmic contacts).
+- [x] 2.4 Ideal-diode slope, current conservation, the Debye-length refusal.
+      **The multi-terminal (four-contact) check is NOT delivered** -- see 2.10.
+      The skip reason on its test says so; it is not a silent pass.
+      **The broken I-V was POLARITY, not the solver.** Forward bias is +V on the
+      p-side; the doping puts n at z > 0 (the top contact), and I was raising the
+      n-side, so every "forward" point was REVERSE bias. Measured: with +V on top,
+      n*p at the junction fell as n_i^2*exp(-V/V_T) -- 4.413e16 at 0.2 V against
+      4.338e16 predicted (0.3 %) -- which is what made a perfectly converged solve
+      look like uncoupled carriers. The lead called this on the n*p direction alone.
+      With +V on the bottom, n*p tracks exp(+V/V_T) to 0.5-2 %.
+      **The measurement that settles it (2026-11-09, 1e18/1e18 junction, n_z=200,
+      refine=5 nm):** 0.30 V 5.586e-13 A, 0.35 V 3.828e-12, 0.40 V 2.631e-11,
+      0.45 V 1.812e-10, 0.50 V 1.248e-09, 0.55 V 8.602e-09. Every 50 mV step is
+      x6.9, so the ideality factor is 1.002-1.005 per step and 1.003 on a
+      least-squares fit over the whole range, against 1.000 ideal (k*T/q computed
+      in the test from CODATA constants, not taken from the solver). The current
+      entering one terminal equals the current leaving the other.
+      **Conservation is an ABSOLUTE statement.** The terminal currents sum to
+      1e-16..4e-15 A at every bias and the sum does not move when the iteration
+      cap goes 40 -> 200, so it is solver round-off. A relative residual is
+      therefore meaningless below the floor: at 0.1 V the current is itself
+      ~1e-16 A and the ratio reads 0.5. `sweep_diode_iv` now reports
+      `i_sum_residual_a` and the test judges on that, using the ratio only where
+      the current is well above the floor. A first draft of the conservation test
+      used the ratio everywhere and "failed" on round-off.
+      **The equilibrium solve is now checked by the solver's own verdict.**
+      `devsim.solve(info=True)` returns `{'converged': bool, 'iterations': ...}`;
+      `_solve_converged` raises `EquilibriumNotReached` when it is False, and all
+      four solves route through it. A first version of the guard RE-SOLVED and
+      compared node values, and that missed a non-converging stage-1 solve
+      (1.0 -> 1.49 -> 0.47 -> 0.94 for 30 iterations) because Newton revisits
+      similar territory on a second call.
+      **WITHDRAWN (lead correction, 2026-11-09):** I blamed the minority-current
+      columns being exactly zero on `is_circuit=False` equilibrium pinning at the
+      contact, and called it the cause of the broken I-V. Both halves are wrong.
+      Pinning carriers to equilibrium at an ohmic contact IS the standard boundary
+      condition -- the top contact is n+ at 1e18, so Electrons = 1e18 there at
+      every bias is correct, and the current comes from the interior rather than
+      from carriers moving at the contact. DEVSIM's own `diode_1d` has both
+      contacts on the silicon region with `is_circuit=False` in this same image and
+      conserves (top 0.018155, bot -0.018155 at 0.5 V, residual 8e-8). The real
+      cause is the polarity above.
+      **The Debye gate is tested in both directions** -- an accepted mesh
+      reporting L_D = 4.088 nm at 1e18, and a refused one naming the region, the
+      worst L_D and the local edge. A gate that only refuses is an outage.
+      These two tests exercise `require_debye_resolved` DIRECTLY. That is
+      narrower than "a solve on an unresolved mesh is refused": aside from the
+      gate call, no code path here is shown to stop a solve, so read the claim
+      as what the tests do and nothing more.
+      **The six-point I-V above is NOT comparable to 2.3's W on mesh
+      resolution** (reviewer finding 2, 2026-11-10). It was measured with
+      `allow_unresolved=True` -- 16 nodes were left unresolved against the
+      Debye gate, so the gate was deliberately bypassed to get the sweep. 2.3's
+      W = 8.540e-08 m was measured on a mesh that RESOLVED L_D and passed the
+      gate. Both results stand on their own terms; they differ in whether the
+      mesh was resolved, so do not cite them side by side as agreeing.
+      **Planar-swap crash (noted, not chased):** replacing the cylindrical
+      `EdgeCouple` with a planar one kills DEVSIM natively with no Python
+      traceback. Recorded so a later reader does not spend a wake on it; the
+      axisymmetric path is the one that ships.
+      **NOT DELIVERED -- the four-terminal check (2026-11-09).** The interior
+      taps `c1`/`c2` are added on planes inside the silicon region, and DEVSIM
+      creates no contact there: measured `get_contact_list` returns only `c0`
+      and `c3`. Two reasons, and the second is the one that matters:
+      (i) the module's own documented rule -- a contact creates nothing
+      unless its box covers a region of a different material; and (ii) that
+      rule is CORRECT for this geometry, because **a contact on a plane
+      inside the bulk is not physical**. In a real nanowire a middle contact
+      is a RING on the outer surface, carrying current in through the
+      circumference. Splitting the region to fake an interior contact would
+      have modelled something that does not exist (lead's ruling, 2026-11-09).
+      The test is a `pytest.mark.skip` naming this, not a deleted test and
+      not a silent pass. Work is tracked as 2.10.
+      Two smaller things were fixed on the way in and are committed: the taps
+      were being passed in metres into a cm mesh (they landed inside the metal
+      row), and `build_grid` refined only the first junction, so the Debye gate
+      correctly refused the second at a 20 nm edge. The three delivered checks
+      (forward slope with n = 1.003, conservation on `i_sum_residual_a`,
+      Debye refusal in both directions) all pass.
+      **WHY 2.4 MOVED A 2.3 NUMBER BY 2.7 %, AND WHY 2.4 IS RIGHT
+      (2026-11-10, lead's merge-blocking question).** W = 8.540402e-08 m on
+      2.3, 8.770540e-08 m after 2.4 -- a 2.70 % shift in an ALREADY-SIGNED-OFF
+      result. The cause is one line, the material `Permittivity`
+      re-statement in `_build_dd_device`. `SetSiliconParameters` writes
+      `Permittivity = eps_si * eps_0` from its OWN module constants,
+      `eps_si = 11.1`, `eps_0 = 8.85e-14`, i.e. `9.8235e-13`, and 11.1 is
+      DEVSIM's generic silicon -- not this material's cited `eps_s = 11.7`.
+      Below 2.4 a caller passing 11.7 was silently solved at 11.1.
+      The direction and size confirm it: W ~ sqrt(eps_s), so
+      sqrt(11.7/11.1) = 1.02667 against the measured
+      8.770540e-08 / 8.540402e-08 = 1.02695, 0.03 % apart. 2.4's width is
+      the one computed with the cited material value, so **2.4 is right and
+      2.3's W was 2.7 % low**.
+      Ruled out by measurement, not argument, in this order: the merge itself
+      (clean, no overlap); `build_grid` (z-lines byte-identical across
+      revisions -- 598 nodes, same spacing, same endpoints); the stage-1
+      tolerance `1e-12 -> 1e-10` (restoring 1e-12 changes nothing); the
+      contact-current readout calls (readout only, not equation setup); and
+      `n_i`/`n1`/`p1` re-statement (`n_i` is 1.0e10 in the module and the
+      caller both, and toggling it alone does not move W -- kept so Poisson's
+      charge term and the contact models agree if a caller ever varies it).
+      Single-variable ablation settles it: re-stating Permittivity ALONE
+      gives 8.770540e-08; dropping it ALONE gives 8.540402e-08.
+      Refinement does not arbitrate -- each revision is converged to 6
+      significant figures across a 3x refinement, so this is a change of
+      material constant, not of accuracy.
+      **The width test no longer hides a change this size.** Its tolerance
+      was 10 %, which let a real 2.624 % shift pass; it now pins the measured
+      8.7705404e-08 to 0.5 % (the value is stable to 3e-5 relative across 2x
+      refinement in both `refine` and `n_z`, so the window is ~160x the
+      numerical spread). Mutation-verified with the module load path asserted:
+      dropping the Permittivity line reproduces 8.5404021e-08 and the test
+      FAILS, as it should.
+- [ ] 2.10 Multi-terminal contacts as SURFACE RINGS. The four-terminal check 2.4 promised is
+      not deliverable in the bulk: a contact on a plane inside the silicon region is not
+      physical, and DEVSIM correctly creates no contact there (measured
+      `get_contact_list` -> only `c0`, `c3`). A middle terminal on a nanowire is a ring on
+      the outer surface, so the model needs the contact on the `r = r_max` riser at a given
+      z, with the current entering through the circumference. Deliver: ring contacts in
+      `_build_mesh` (a vertical segment contact at `x = r_max` spanning a z window), the
+      multi-terminal solve rebuilt on them, and the skipped
+      `test_four_terminals_carry_currents_that_sum_to_zero` turned on and passing.
+      Do NOT split the silicon region to fake an interior ohmic contact.
 - [ ] 2.5 The size check: price the 3-D run from the mesh it would build — node and edge
       counts of the actual geometry through the allocator's array sizes — and refuse
-      terminally against the Job's 16 GiB, naming the estimate, the limit and the
+      terminally against the **Job's 14 GiB**, naming the estimate, the limit and the
       axisymmetric form when the device is round. Two-geometry test proves the estimate is
       the device's own. A native solve is never attempted to find out.
+      - **The limit is 14 GiB, not 16.** `web/app.py` builds the Job with
+        `memory=CFG.JOB_MEMORY`, and `web/config.py` now reads that from
+        `mse_common.DEFAULT_JOB_MEMORY_BYTES` (14 * 1024**3). The 16Gi in
+        `manifests/mse/power-cap.yaml` is the namespace's *admission ceiling*, not the
+        Job's limit: refusing against 16 would admit a 15 GiB run and let the kubelet
+        OOM-kill it, which is the failure this task exists to prevent. One constant, read
+        by the app (which builds the Job) and by the solver (which prices the run).
+      - **Built.** `estimate_job_bytes(grid)` prices the mesh `build_grid` would hand
+        DEVSIM, from `n_nodes` and the structured edge count
+        `(n_r-1)*n_z + n_r*(n_z-1)` — no solve, no allocation.
+        `require_job_memory(grid, limit_bytes=None, regions, contacts, roundness_ratio)`
+        raises `TooBigForJob` (a `ValueError`) naming the estimate, the limit, node count,
+        edge count and "before any solve", and adds the axisymmetric hint when the caller
+        passes a round `roundness_ratio`. Both are called at the top of every DEVSIM solve
+        in the module (`solve_abrupt_junction`, `solve_abrupt_junction_dd`,
+        `sweep_diode_iv`, `solve_multi_terminal`), so the check gates real runs rather than
+        sitting unused.
+      - **A wiring defect the first version shipped, found by the reviewer at 095c50f.**
+        `solve_abrupt_junction` called `require_job_memory(g)` with no `g` in scope -- a
+        `NameError` on the one path no test drove. Fixed, and
+        `tests/test_dd_size_wiring.py` now drives `solve_abrupt_junction_dd` through both
+        an admitted solve and a refused one, so "gates real runs" is tested through a
+        solve path and not only through the helper.
+      - **A second defect, found while writing that test and NOT fixed here.**
+        `solve_abrupt_junction` (the potential-only path) does not converge even with its
+        own default arguments: `devsim_py3.error: Convergence failure!`, RelError
+        1.00000e+00 / AbsError 3.26e-01, on `PotentialEquation`. It has no caller, which
+        is why nothing noticed. 2.3 solved the same device by RAMPING (a first solve at
+        `absolute_error=1.0`, then tightening); this path asks for `1e-9` in a single
+        solve, so the series has nowhere to start. Recorded as its own task below rather
+        than repaired inside a size-check change: it is a numerical-method fix, not a
+        wiring fix, and the size check is not what makes it fail.
+      - **Measured, and it does not support the n^1.5 term.** Peak RSS of one coupled
+        drift-diffusion solve, inside the image at `--cpus=2 --memory=2g`:
+
+        | nodes | peak RSS | estimate | est/real |
+        |------:|---------:|---------:|---------:|
+        | 6,432 | 0.112 GiB | 0.232 GiB | 1.8x |
+        | 11,040 | 0.169 GiB | 0.521 GiB | 2.9x |
+        | 20,280 | 0.290 GiB | 1.295 GiB | 4.6x |
+
+        Measured log-log slope is **0.83** (0.76 between the first pair, 0.89 between the
+        second). The estimator's `O(nodes * sqrt(nodes))` fill term gives slope ~1.5, and
+        the disagreement *grows* with size: fitting the three points and extrapolating,
+        the estimate at 95,484 nodes is 13.2 GiB where the trend predicts ~1.0 GiB
+        (12.7x), and at 142,932 nodes 24.2 GiB against ~1.5 GiB (16.7x). So the current
+        model would refuse a ~95k-node mesh that fits comfortably — a false refusal, not
+        a safety margin, which is the failure mode 2.5's own text warns against.
+        The estimate is still conservative everywhere measured (never below the true
+        peak), so wiring it in cannot cause an OOM; the open question is only how much it
+        over-refuses.
+      - **Decided by the lead 2026-11-10: option (a), keep the cautious bound.** The
+        three measured points are 2-D axisymmetric grids; this gate prices 3-D tet runs,
+        where direct-solver fill grows faster than in 2-D. Moving the threshold along a
+        2-D trend extrapolated 16.7x would admit exactly the runs we know least about.
+        Over-refusal is the safe failure, and nothing 3-D exists yet to be refused.
+        Options considered: (a) keep n^1.5 as a deliberately over-conservative bound and
+        accept false refusals above ~90k nodes; (b) replace it with the measured slope,
+        honest about what was observed but a fit to three points on one machine; (c) keep
+        the bound and raise the refusal threshold to where the *measured* trend crosses
+        14 GiB. The builder recommended (c); the lead ruled (a) on the 2-D-vs-3-D ground.
+      - **What the constant is, stated plainly.** The 40x rate and the n^1.5 law were
+        calibrated TOGETHER as ONE conservative bound — not as two independent physical
+        claims about LU fill. The comment in `mse_axisymmetric.py` now says so, and says
+        the bound is deliberately pessimistic rather than tuned to the measurements.
+
 - [x] 2.6 The roundness check: circumradius/inradius within 2 % for the axisymmetric form,
       measured from the uploaded geometry, refused at upload naming both figures.
       **Done (measurement + upload refusal; the route call is 4.3's).**
@@ -1064,9 +1331,1125 @@ proven red once (mutate, confirm exit 1, revert) before the check counts.
         near-round non-symmetric body is measured only about those six candidates.
 - [ ] 2.7 Coarse 3-D form on the tet mesh, admitted only when 2.5's estimate fits; the
       axisymmetric-vs-3-D agreement at ≤ 10¹⁶ cm⁻³ (tier 2 or 3, measure RSS).
-- [ ] 2.8 Transient: charge balance and junction capacitance; g(t) at the dot.
+      **Also recalibrate 2.5's bound here (lead, 2026-11-10):** measure real 3-D peak RSS
+      at ≥ 3 sizes in a bounded tier-3 Job, then revisit the threshold. 2.5's bound is
+      calibrated on 2-D axisymmetric grids and is deliberately conservative for 3-D; it
+      should not be moved until there are 3-D measurements to move it with.
+      **STATE 2026-11-10 (measured, not estimated):** the 3-D route exists and runs.
+      DEVSIM 2.11.2 in our image has NO 3-D mesh-creation API (`create_1d_mesh`,
+      `create_2d_mesh`, `create_gmsh_mesh`, and nothing else), so 3-D must arrive as a
+      gmsh tet file; `tetrahedralize_layers` + a boundary-group writer feed
+      `create_gmsh_mesh`. Contacts additionally need dimension-2 physical groups, because
+      `write_gmsh22` emits only 3-D tetrahedra groups and without surface groups
+      `add_gmsh_contact` binds nothing: every terminal reads exactly 0 A while the solve
+      reports converged. `write_gmsh22_with_boundaries` (committed `d312d2a`) emits them.
+      **V_bi AGREES, and the "0.715 vs 0.875 V gap" reported earlier was MY ERROR.**
+      Analytic at 10¹⁶/10¹⁶ is 0.714317 V; the 3-D form measures 0.715290 V and the
+      axisymmetric form 0.715293 V — both within 0.14 % of analytic, 0.0004 % of each
+      other. The 0.875 V baseline was never computed; it was carried from memory and
+      matches the analytic value for heavier junctions (~0.87 V at ~5·10¹⁶). Nothing
+      could have caught it by comparing the two solves, because neither was the bad
+      number. See `2.7-feasibility.md` for the retraction.
+      **OPEN:** stage-3 coupled drift-diffusion does not converge on the coarse tet
+      mesh — and "does not converge" is the measured shape, not a loose description.
+      `absolute_error=1e10` there is DEVSIM's own DD setting (`diode_2d.py`), not a
+      mistake. Measured 2026-11-10 with the full iteration log: stage 1 converges in
+      14 iterations (1.25e-1 → 6.73e-17, quadratic at the end); stage 3 falls once to
+      3.3, then oscillates in a 2.8–4.7 AbsError band for all 199 remaining
+      iterations. It never enters a decaying regime, so it is a plateau, not a slow
+      approach, and a larger budget cannot fix it (120 and 200 give the same plateau).
+      Cell Péclet number is ruled out: the mesh is 3.7× denser below the depletion
+      edge (2.5e-7 m against a 67 nm edge), so advection is resolved. Remaining
+      candidates are coupled-system conditioning through a coarse tet junction and
+      the contact boundary treatment on a rough tet surface. The axisymmetric path
+      reaches 1e-10 with the SAME staged physics, so the difference is the mesh shape,
+      not the model. **Both candidates predict refinement helps and both predict the
+      plateau, so the log does not choose between them** — that is what the refinement
+      study has to do. Do NOT loosen the tolerance to make the solve pass: what the
+      number should be is exactly the thing still unknown. Trajectory table in
+      `2.7-feasibility.md` Finding 4.
+      **RSS CALIBRATION, built and NOT run** (task 3; builder seats do not apply
+      manifests): `scripts/dd_3d_rss.py` + `manifests/mse/dd3d-rss-job.yaml`, an
+      Indexed Job with 4 completions × 1 pod each (4 CPU / 13Gi, inside the
+      LimitRange's 4 CPU / 16Gi ceiling and leaving the app 5Gi of the namespace's
+      18Gi) at edges 1.6e-7 / 1.0e-7 / 7.0e-8 / 5.0e-8 m. One size per pod because
+      peak RSS is a per-process high-water mark and DEVSIM stays resident — a loop
+      would report the largest size's peak for every row. Prints
+      `RESULT size=… nodes=… edges=… estimate_bytes=… peak_rss_bytes=… ratio=…` per size.
+      The script prices the mesh through the estimator's own function
+      (`estimate_tet_job_bytes`, extracted from `_require_tet_job_memory` for this)
+      so the ratio is not a comparison between two transcriptions of the formula.
+      **THE SIZES ARE MEASURED, NOT ASSUMED** (2026-11-10, 1 µm radius, 2 µm stack,
+      default n_across): 1.6e-7 → 1,136 nodes / 5,201 tets / 0.018 GiB estimate;
+      1.0e-7 → 4,307 / 21,926 / 0.128 GiB; 7.0e-8 → 12,157 / 65,949 / 0.605 GiB;
+      5.0e-8 → 32,430 / 181,319 / 2.627 GiB. A 3.2× linear span and 146× in estimate.
+      5.0e-8 is the finest the image's 200k-tet cap allows (4.0e-8 needs 352,351 and
+      the mesher refuses). Note these estimates are far BELOW the 13Gi limit, so
+      "fits the Job" is not in doubt at any of them; what the run buys is the
+      estimate-to-RSS RATIO, which is the number a recalibrated threshold needs.
+      A single local data point at edge 1.6e-7 gave peak RSS 124.7 MB against a
+      19.0 MB estimate — ratio 6.58 — but interpreter and DEVSIM baseline overhead
+      dominate a solve that small, so that figure says nothing yet about the LAW.
+      Whether the ratio grows (pricing law wrong, threshold unsafe for 3-D) or
+      shrinks (fixed overhead, threshold conservative) toward larger sizes is exactly
+      what the four-point run decides. Do not read the 6.58 as a verdict.
+      **WIDTH AGREEMENT (2.7 part 2, lead 2026-11-10).** Why V_bi was not enough:
+      it is fixed by the contact BC and n_i, and the reviewer showed a 5 %
+      permittivity error leaves it unchanged. Width comes out of the Poisson solve.
+      Measured 1e16, eps_s 11.7: 3-D vs axisymmetric 10-90 % width, 2.515978e-07
+      against 2.603206e-07 m, a 3.35 % difference at edge 1e-7. THE SPAN IS A
+      CLIFF, NOT A CONVERGENCE TAIL — the sweep is 26.0 % at 2.5e-7, 27.8 % at
+      1.6e-7, 3.35 % at 1e-7, 1.24 % at 7e-8. At 1.6e-7 and coarser the 3-D width
+      is SHORTER than the axisymmetric one, i.e. the depletion region is not
+      resolved and the mesher's thin sub-slabs set the answer. A width comparison
+      is physics only at edge ≤ 1e-7; above that it measures the mesh. The test
+      `test_the_two_forms_agree_on_the_depletion_width` runs at 1e-7 with a 5 %
+      window (≈1.5× the measured 3.35 % discretisation error, and explicitly a
+      mesh bound, not a physics claim).
+      **THE LEAD'S SUGGESTED MUTATION DOES NOT WORK, and the first explanation of
+      why was also wrong. RE-MEASURED 2026-11-10 after review.** All figures are
+      rel(w_3d, w_ax) at the test's fixture (n_a = n_d = 1e16, eps_s = 11.7, edge
+      1e-7) — the quantity the test asserts. The earlier entry quoted the 3-D
+      width's self-shift instead, which is a different, larger number, and that is
+      why its figures would not reproduce.
+      *Permittivity is CANCELLATION, not drowning.* A 5 % eps_s error raises the
+      3-D width 2.515978e-07 → 2.611917e-07 m, TOWARD the axisymmetric
+      2.603206e-07, so the ratio FALLS 3.35 % → 2.08 %. Discretisation error and
+      permittivity error point the same way and partly cancel. Catching it needs a
+      window < 2.08 %, which the clean 3.35 % already fails. This is a coincidence
+      of sign at this mesh — if a mesh change flips it the mutant becomes catchable
+      and the window was never chosen for it.
+      *The doping evidence is much weaker than first recorded.* Measured, same
+      quantity: n_d +5 % → 6.22 % (fails, but only 2.9 points above the clean
+      3.35 %); n_d ×2 → 5.32 % (fails by 0.32 points); n_d −5 % → 0.93 %, n_d ×0.1
+      → 1.02 %, n_a·n_d ×1.2 → 2.98 %, ×0.8 → 1.76 % — ALL PASS. The original
+      4.06 % / 13.6 % figures were self-shifts and are withdrawn. At this fixture
+      n_a == n_d, so swapping them is a no-op the test could never catch.
+      The test's real catch is a large UPWARD n_d error and little else. It is kept
+      (the only test reading a quantity out of the 3-D Poisson solve) with its
+      docstring stating these margins. PERMITTIVITY REMAINS COVERED BY THE
+      AXISYMMETRIC WIDTH TEST (0.5 % window, mesh where the signal resolves).
+      **BIASED 3-D PATH, recorded plainly (lead's wording, verified 2026-11-10).**
+      Any non-empty `biases` argument raises `EquilibriumNotReached` today, because
+      a bias solve runs stage-3 coupled DD and stage 3 does not converge on the tet
+      mesh. Verified directly with `biases=(0.3,)` at edge 2.5e-7: it raised. BIASED
+      CURRENT HAS NEVER BEEN PRODUCED on the 3-D path. This is not a loose-tolerance
+      issue and must not be described as one: raising the iteration budget or
+      relaxing `relative_error` would not make a biased solve arrive, because the
+      non-convergence is a plateau (Finding 4). It stays open with the refinement
+      study.
+      NOT YET MEASURED — every ratio column waiting on the Job is pending the lead's
+      run, and no 2.5 threshold may move until it exists.
+      **CALIBRATION RAN 2026-11-10 (lead, tier-3 Job `mse-dd3d-rss`, image 7dbd3b4,
+      4 sizes, 13Gi / 4 CPU).** Results, from pod logs:
+      | edge | nodes | raw estimate | peak RSS | ratio | stage-3 |
+      |------|-------|--------------|----------|-------|---------|
+      | 1.6e-7 | 1,136  | 18,944,907 B  | 123,490,304 B | 6.518 | NOT converged |
+      | 1.0e-7 | 4,307  | 137,925,456 B | 503,398,400 B | 3.650 | NOT converged |
+      | 7.0e-8 | 12,157 | 649,930,832 B | 1,519,611,904 B | 2.338 | converged |
+      | 5.0e-8 | 32,430 | 2,820,904,163 B | — | — | **FAILED in UMFPACK** |
+      The ratio FALLS with size, so the 6.5x at the coarsest size is fixed process
+      overhead, not a pricing law — which is exactly what the earlier single local
+      point could not decide and did not claim.
+      **TASK 3, STATED HONESTLY: two of the four RSS points are NON-CONVERGED runs.**
+      Stage-3 coupled DD did not converge at 1.6e-7 or 1.0e-7 (the known plateau,
+      Finding 4). Their peak RSS is therefore the cost of a run that assembled and
+      factored to a plateau and then stopped — a real high-water mark for those sizes
+      under the shipped budget, but not a converged solve's cost. Only 7.0e-8 is a
+      converged point. The fit below is quoted over the two LARGEST points, one of
+      which is converged, so the slope it turns on is not all plateau data; that is
+      stated rather than glossed.
+      **TASK 1, THE RE-PRICING.** Fitting `peak = a + b * raw` with the two largest
+      points gives a ≈ 0.22 GB and b ≈ 2.0 (the two residuals `peak - 2*raw` are
+      2.275e8 and 2.198e8 B, agreeing to 3.5 %). Implemented as
+      `TET_FIXED_OVERHEAD_BYTES = 2.20e8` and `TET_ESTIMATE_FACTOR = 2.0`, applied
+      inside `estimate_tet_job_bytes` so the refusal and the published price cannot
+      diverge, with `raw=True` returning the uncalibrated sum for the calibration
+      script. The axisymmetric `estimate_job_bytes` is UNCHANGED — its slope has not
+      been measured the same way. Direction matters and is now the opposite of what
+      the old comment asserted: the pre-calibration gate called itself pessimistic
+      for 3-D and was in fact OPTIMISTIC by ~2x, i.e. it admitted runs that died.
+      Two tests pin this: `test_the_3d_price_is_calibrated_by_the_measured_factor`
+      (fails if the factor is removed — mutation-verified by deleting the term, which
+      failed both calibration tests) and
+      `test_the_calibrated_3d_price_brackets_the_measured_peaks`.
+      The calibrated price tracks the two bracketed peaks (4307 and 12157 nodes)
+      to 1.5 % and 0.0 %; only the latter is a converged run.
+      **TASK 2, THE 5.0e-8 FAILURE.** The image links `umfpack_di_*` — the 32-bit
+      signed-integer index variant of UMFPACK 5.1 (`libumfpack_lgpl.so`, symbols
+      `umfpack_di_symbolic` / `umfpack_di_numeric`, confirmed by inspecting the
+      shipped loader). The failure is NOT the pod's 13Gi limit: the Job was not
+      OOMKilled, UMFPACK itself returned its out-of-memory status. Measured locally,
+      small probes only: the SAME edge 5.0e-8 solves fine with
+      `equilibrium_only=True` at 32,430 nodes / 181,319 tets / 1.32 GB peak RSS,
+      so neither meshing nor the stage-1 factorisation is the ceiling; the coupled
+      stage-3 Jacobian on the same mesh is what dies.
+
+      **CEILING, MEASURED (2026-11-10).** Reproduced the same failure locally with
+      a 13 GiB container limit: edge 5.0e-8, coupled solve, raises
+      `RuntimeError: umfpack numeric failed` after 360 s at **peak RSS 3,079 MB**.
+      The limit is therefore NOT memory — the process died using 3 GB of a 13 GB
+      allowance, so raising any Job `memory` limit cannot admit this size. The
+      ceiling is structural inside `umfpack_di_numeric` (32-bit `di` workspace /
+      tuple overflow), between the largest size that factors (edge 6.0e-8,
+      18,957 nodes / 104k tets, stage 1 only) and 5.0e-8 coupled
+      (32,430 nodes / 181,319 tets). Remedies are a solver-path change, a coarser
+      mesh through the junction, or UMFPACK's 64-bit `dl` variant — none of them a
+      bigger pod.
+
+      **The size gate CANNOT exclude this failure.** Measured: the calibrated
+      price at 5.0e-8 is 5.45 GiB against the 14 GiB gate, so the gate ADMITS it.
+      This is not a calibration error — it is a shape mismatch. The gate prices
+      peak memory, and the failing run peaked at 3.08 GB, BELOW its own 5.45 GiB
+      price. A mesh can be too ill-conditioned to factor while looking cheap on
+      every memory metric. Excluding this class needs a non-memory admission
+      criterion (e.g. a factorisation-attempt with a bounded retry, or a
+      conditional-number / pivot-growth check), which is NOT implemented and is
+      proposed as task 2.13 rather than silently claimed here.
+
+      **V_bi does not depend on stage 3.** `_install_dd_physics(...,
+      equilibrium_only=True)` stops after stage 1, and `solve_layered_dd_3d`
+      passes it through, because the built-in voltage is fixed by the
+      equilibrium solution and no later stage can move it. The V_bi agreement
+      tests use it: reading V_bi from a full DD run would have reported stage-3's
+      convergence failure as a V_bi disagreement, which is a false diagnosis.
+      The agreement band (3 %) is a PLACEHOLDER, not a measurement — an earlier
+      docstring claimed it was the sum of measured mesh-resolution differences
+      and that was never measured. Making it real needs the refinement study.
+- [ ] PARTIAL 2.8 Transient: charge balance and junction capacitance; g(t) at
+      the dot.
+      **2026-11-11 (`qitem-20261111104128`).** `transient_pulse()` is written
+      and RUNS: it ramps to `v_initial`, initialises DEVSIM's time data with
+      `transient_dc`, then steps with `transient_bdf1`, returning t, v, q,
+      i_contact and the integrated pair rate. Two things are verified:
+      the recombination SIGN was backwards (fixed -- see below), and the
+      terminal currents are conserved across the two contacts to 5e-16 A.
+
+      WHAT IS NOT DONE: the charge balance `∫I dt = ΔQ + q∫R dt` does not
+      close, and I could not make it close. Measured facts, so a successor
+      does not re-derive them. DEVICE AND DRIVE, stated because the first
+      version of this note omitted them and its numbers did not reproduce:
+      `n_a=n_d=1e17`, `n_i=1e10`, `z ∈ [-3e-7, 3e-7]`, `n_r=2`, `n_z=200`,
+      `refine=1e-9`, `refine_halfwidth=5e-8`; ramped to 0.30 V in 9 DC steps,
+      then stepped to 0.32 V at `t=dt`; `t_end=4·dt`; SOLVER IMAGE
+      `registry.example/mode-search-engine/mse-solver:devsim-2.1`.
+
+      CORRECTION 2026-11-11 (lead finding, re-measured): the earlier note in
+      this file claimed `∫I dt` was "the SAME to 3 digits" across dt and that
+      the first post-step current reproduced "to NINE digits". BOTH WERE
+      FALSE, and the way they were false is worth recording: the sweep ran
+      several dt values in ONE process, the second and later calls died on
+      `devsim_py3.error: A mesh already exists with name "axtr"`, and the
+      tracebacks were mistaken for output rows. Re-measured in SEPARATE
+      PROCESSES:
+        dt=2e-12  ∫I dt=1.783931e-15 C  i[1]=5.47901268e-04 A
+        dt=2e-13  ∫I dt=6.777648e-16 C  i[1]=1.07330438e-03 A
+        dt=2e-14  ∫I dt=7.693615e-17 C  i[1]=1.08905568e-03 A
+      So `∫I dt` falls roughly with dt while `i[1]` RISES and converges
+      toward ~1.09e-3 A. That is the signature of a genuine displacement
+      current at the step, not a constant artefact -- the opposite of what
+      the old note concluded. The reviewer measured 9.81e-15 / 9.57e-15 /
+      3.09e-15 C on their device and bias; a residual that moves with dt
+      and with the device is itself evidence, and the two sets are recorded
+      side by side rather than reconciled by picking one.
+      `i[1]` vs `i[30]` on the same run: 5.4790126827e-04 vs
+      2.4120750246e-11 A -- seven orders apart, NOT identical. The decaying
+      transient is what one should expect; the "NINE digits" claim was the
+      same misread output.
+        - The solver is not broken: at a steady drive the recorded and
+          directly-read contact currents agree to 16 digits, and the two
+          contacts sum to -4.9e-16 A. The recorded value is genuine.
+        - `ΔQ_mobile = -8.9e-24 C` and `q∫R dt = 1.2e-30 C`, so the two
+          right-hand terms are ~1e9 times smaller than the left. The charge
+          crossing the contacts is not going into the silicon's mobile
+          carriers, and in a device this thin (2.5e-16 cm^3) there is almost
+          no recombination to absorb it.
+      NEXT: HYPOTHESIS, NOT A FINDING -- the balance may need the FIXED
+      dopant charge and the metal-contact/interface charge rather than only
+      mobile carriers. `Σq(p-n+Nd)V` is also ~0 (the device is neutral), so
+      the right variable may be the charge on the contacts themselves. This
+      is untested. Do NOT simply loosen the tolerance until the test passes,
+      and do not treat the candidate above as established.
+
+      MEASURED 2026-11-11 (`qitem-20261111113210`): the imbalance is not in
+      my integral, it is in DEVSIM's step, and DEVSIM says so itself. When a
+      transient solve is asked to converge on charge (`charge_error`, a
+      separate tolerance from the equation residuals), it prints
+      `Charge Relative Error` -- DEVSIM's own source calls this "the relative
+      error between projected and solved charge during transient simulation".
+      On a GENUINELY DRIVEN step (0.30 -> 0.32 V, bias set on the metal
+      regions, currents ~5e-4 A) it reports **8.2e-2 falling to 1.5e-5**
+      across the steps, and it CANNOT be tightened: forcing `charge_error`
+      to 1e-6, 1e-8 or 1e-10 stalls at **1.08e-1** and the solve fails. So
+      the step is genuinely not conserving charge, and `transient_pulse`'s
+      `charge_error=1.0` was accepting steps whose charge error was ~1e-1.
+      That is the mechanism behind `∫I dt != ΔQ`: the left side integrates
+      the current DEVSIM produced, the right side is the charge that
+      actually moved, and DEVSIM is telling us those differ by ~1e-1.
+
+      Two control measurements pin the cause down and both are NO-OPS, which
+      is why they are recorded rather than presented as fixes:
+        - Setting the bias on the DEVICE parameter `top_bias` instead of the
+          `metal_top`/`metal_bottom` regions gives a charge error of 2.3e-30
+          (machine zero) -- but the electron current is 4.4e-34 A, i.e. the
+          state does not move at all. Conserved because nothing happens.
+        - A CIRCUIT contact (`circuit_contacts="top"`, `KTop`/`KTop.I`,
+          driven with `circuit_alter(name="V1", value=...)` as DEVSIM's own
+          `tran_diode.py` does) also reports 2.3e-30 -- and again `V1.I` is
+          ~1e-37 A, another no-op. The circuit contact does NOT fix the
+          balance; it merely stops the device moving.
+      So the circuit-contact route is NOT the fix, and neither is a tighter
+      tolerance. Anyone repeating these will get 2.3e-30 and should check the
+      CURRENT before concluding conservation.
+
+      LEADING HYPOTHESIS for a successor (untested, and deliberately not
+      asserted): a `bdf1` step taken directly at a bias discontinuity projects
+      charge poorly. The cure in the literature and in DEVSIM's own example is
+      to avoid a hard step -- ramp in small DC increments to the new bias and
+      let each transient step start from a charge-consistent state. The
+      earlier "ramped rather than stepped" probe did NOT close the balance
+      either, so treat this as a candidate to TEST, not to assume.
+
+      **IT WAS TESTED AND IT FAILED (2026-11-11, same row).** Relaxing to a
+      charge-consistent start does NOT rescue the step. Measured on the
+      fixture (before -> 0.32 V, dt=2e-12):
+        - Relax first (20 bdf1 steps at dt into a re-init `transient_dc`),
+          then take the step: charge error **1.42e-07**, current does not
+          move (1.42e-15 A before and after). Tiny error because nothing
+          happens -- the same no-op signature as the two controls above.
+          Check the current, not the error.
+        - Via the integrator, 1 ramp step then 300 idle steps, 0.02 V:
+          first post-step current **1.798e-03 A**; the same bias set at
+          DEVICE scope gives the resting -2.3263e-15 A. Only the
+          region-scoped drive moves anything, and it moves discontinuously.
+      **CORRECTED 2026-11-11 (lead's row: "first find out why the re-solve
+      is not happening"). The 11 % figure above is real as a number and
+      WRONG as a diagnosis, and the "re-seed" record was a probe bug.**
+        (a) The re-seed DID take effect. `probe_seed4.py` parsed its shift
+            as `int(sys.argv[3])`, so the intended "-0.02" aborted with
+            ValueError and the run reported was really shift=+0.02. Made it
+            a float (`probe_seed5.py`) and re-ran with shifts +0.02, -0.02
+            and +1.0 V: all three give finalI=-2.3263e-15 A. A one-Newton
+            -iteration probe confirms the seed lands (Phi differs by exactly
+            0.04 V between the +/-0.02 seeds after the first iteration), so
+            the seed is applied and the solve then walks away from it. That
+            is not a no-op: the transient step has a small Jacobian time term
+            (dt=2e-12) and the initial guess barely matters.
+        (b) THE 11 % IS NOT AN IMBALANCE. It is both contacts read from the
+            SAME side of the step. `I(top)` and `I(bottom)` at the end of the
+            bdf1 step return exactly the DC answer for 0.32 V
+            (1.798112e-03 / -1.672860e-03, identical). The top and bottom
+            legs of THIS fixture do not carry equal current in DC either --
+            the two contacts see different areas -- so comparing them to each
+            other was never a conservation test.
+        (c) THE REAL CHECK, for a two-terminal device, is the SERIES current
+            against the change in stored charge. Using the midpoint of the
+            two legs as the series current I=0.5*(I_top-I_bottom), per step
+            at 0.30 -> 0.32 V, dt=2e-12:
+              step  pred=0.5*(I_{k-1}+I_k)*dt   actual dQ
+                1        1.7355e-15            4.203e-21
+                2        2.2421e-15           -2.521e-21
+                3        6.5943e-16           -1.130e-21
+                4        1.9930e-16           -3.796e-22
+                5        6.0754e-17           -1.194e-22
+                6        1.8569e-17           -3.682e-23
+            So the charge balance is off by ~6 orders, now measured the
+            right way. THAT is the open defect. Compare series current with
+            stored charge, never the two contact legs with each other.
+        (d) WHY the series current is so large: it is a dielectric-relaxation
+            current, not conduction. On 2e-12 s the device is still
+            redistributing charge after a bias jump; the current decays
+            1.7355e-03 -> 4.3492e-06 A over six steps and the sign of dQ
+            flips after step 1 (charge overshoot). Whether that decay is
+            physical or an artefact of the half-step integration is the next
+            thing to settle, and it is a property of the step, not of the
+            start state.
+        (e) DEVSIM reports `Charge Relative Error` 8.90211e-02 on the final
+            accepted step, consistent with the ~6 order gap: the solver knows
+            the step charge is poor. Raising `charge_error` (the 0.2 default)
+            is NOT the fix; it is the solver telling us the same thing the
+            table shows.
+      Where the transient's electrode charge sits
+      (metal region? contact node? the 2-node contact weight?) is the next
+      thing to measure.
+
+      HOW THOSE TWO NUMBERS WERE TAKEN (added 2026-11-11, reviewer finding:
+      `transient_pulse` returns only the p-contact current, so the figure
+      could not be re-derived from its dict):
+        - Device: `transient_pulse`'s own construction -- `build_grid`,
+          `_build_dd_device(net_doping=1e17 / -1e17, n_i=1e10,
+          eps_s=11.7, mesh_name="axtr")`, extended solver/models/equations
+          on, `n_r=2, n_z=100` (the integrator probe, coarser than the
+          200-row fixture), `refine=1e-9, refine_halfwidth=5e-8`.
+        - Contacts: the mesh's two ends, named `"top"` and `"bottom"`
+          (`z>0` is n-side, `z<0` is p-side). `transient_pulse` picks
+          `p_contact = "top"` for this doping and reports only that one.
+        - Drive: 0.30 V reached by DC ramp, `transient_dc` init, then a
+          single bias change to 0.32 V set at REGION scope (silicon,
+          metal_top, metal_bottom) -- device scope moves nothing.
+        - Probing: `_contact_currents(devsim, ("top","bottom"))`, i.e.
+          `get_contact_current(equation=ece_name) + (...hce_name)` per
+          contact, at the first bdf1 step. It is NOT `i_contact[1]` from
+          the returned dict; that is the p contact alone and equals the
+          `I(top)` above.
+        - The DC pair quoted just below comes from the same probe before
+          any step, on the same device.
+      Also for a successor: a one-time re-seed (recreating the
+      Potential/Electrons/Holes solutions from the pre-step state, with and
+      without a +0.02 V shift, before applying the bias) removes the step
+      COMPLETELY -- I(top) returns to -2.3263e-15 A for EVERY seed tried,
+      including a deliberately wrong -0.02 V shift. A seed that cannot tell
+      a wrong answer from a right one is evidence the re-solve is not
+      happening, not evidence the balance closes. Do not read it as a fix.
+      DC BALANCE FIGURE (measured on the fixtures above): with both contacts
+      probed at 0.30 V after `_solve_at_bias`, I_top=-2.3263e-15 A and
+      I_bottom=-8.2538e-16 A -- both ~1e-15, i.e. the device balances in DC
+      and does not in transient.
+      Not yet built: junction capacitance (`C = dQ/dV`) is still absent.
+
+      One cheap thing IS proven: the recombination SIGN. See
+      `tests/test_transient_pulse.py`, mutation-proved by flipping the return
+      back to `-sum(...)`.
+
+      `g(t)` is DELIBERATELY ABSENT, and this must not be "filled in":
+      DEVSIM's SRH is non-radiative, so the radiative pair rate the emitter
+      coupling needs is `B*n*p` over the dot, which requires a CITED
+      radiative coefficient `B` for the dot material. None is in the
+      library. `transient_pulse` returns the pair rate and the carrier
+      densities so a caller holding a sourced `B` can form it; inventing the
+      value here would be a number with no model behind it.
+
+      Recombination sign, FIXED and sourced: `_recombination_per_second`
+      returned `-sum(USRH*vol)` with a docstring claiming positive USRH means
+      generation. `simple_physics.CreateSRH` line 257 defines
+      `USRH = (np - n_i^2)/(...)`, so POSITIVE is net RECOMBINATION; the doc
+      and the code both had it inverted. Measured on the device: np/n_i^2 =
+      40.6 (excess pairs, so recombination) with USRH positive on 99.2% of
+      nodes. The function now returns `+sum(...)`. Anchor this at the
+      formula, never at the model name `ElectronGeneration` (which is
+      `-q*USRH`, a continuity-term sign, not the sign of USRH).
+
+      **Junction capacitance, MEASURED but NOT CONVERGED (2026-11-11,
+      `qitem-20261111114334`).** `C = dQ/dV` from DEVSIM's own
+      `get_contact_charge(contact="top", equation="PotentialEquation")` on the
+      2.8 device (n_a=n_d=1e17, r_max=4e-8 m, i.e. 4e-6 cm, z_lo/hi=-3e-7/+3e-7 m,
+      n_r=2, n_z=100). Each bias is an independent converged DC solve; the
+      per-step `RelError` falls to 1e-13..1e-14 on the PotentialEquation.
+
+      | V (V) | Q_top (C) | C=dQ/dV (F) |
+      |-------|-----------|-------------|
+      | 0.10  | 6.068600e-21 | — |
+      | 0.20  | 8.354568e-21 | 2.285968e-20 @0.15 |
+      | 0.30  | 1.131769e-20 | 2.963118e-20 @0.25 |
+      | 0.40  | 1.512050e-20 | 3.802818e-20 @0.35 |
+      | 0.50  | 1.995825e-20 | 4.837744e-20 @0.45 |
+
+      **It rises monotonically with forward bias**, which is the direction a
+      junction capacitance should take as the diode conducts. That is the
+      only claim that holds today.
+
+      > **SUPERSEDED the same day -- read the convergence block at the end of
+      > this entry before using anything below.** These numbers were taken
+      > with an UNGUARDED `devsim.solve` that does not raise on
+      > non-convergence, and several of the states behind them had
+      > `RelError = 1.0` (solver stopped at the iteration limit). The
+      > n_z-dependence described here is real but is a roughly 1/n_z decrease
+      > over this range; Q_inf is NOT established (the phase-2 five-point
+      > refit puts it in 3.9--6.9e-21 C). Kept because the
+      > measurements are real and the correction is the point.
+
+      **IT DOES NOT CONVERGE, so do NOT quote these numbers as C.** Measured
+      across the two resolutions that matter:
+      - `n_r` 2 -> 4: C = 4.320281e-20 F BOTH times, identical to 6 digits.
+        The radial direction is not what limits it.
+      - `n_z` 100 -> 200: C = 4.320281e-20 -> 3.089105e-20 F, a 29 % DROP.
+
+      A physical capacitance cannot depend on how finely z is sliced, so at
+      least part of the remaining gap below the parallel-plate reference is
+      discretisation, and the true converged value is not established.
+      SUPERSEDED, see the corrections block at ~2050: this paragraph's
+      "4.43e-19 F" reference and the "10x gap" are both wrong (correct
+      reference 8.678486e-19 F, gap 20x-54x), and the n_z sequence does
+      decrease roughly like 1/n_z once the fit is done over all five points
+      (Q_inf itself unestablished, see ~1796). Left in
+      place as the record of what was believed here. The reference itself is only a
+      sanity scale: a real junction is not a parallel-plate capacitor, so
+      agreement was never the pass condition -- convergence is, and it is
+      unmet.
+
+      **It also depends on the SOLVE PATH, which is worse than the mesh
+      dependence.** The same nominal device driven by ramping through every
+      step and solving at each (n_z=100, 0.30->0.50 V) gives a THIRD value,
+      C = 2.711967e-20 F with q_lo = -3.253363e-22 C and q_hi = 5.098598e-21 C
+      -- not the 4.320281e-20 above. Three paths, three values
+      (4.32e-20 / 3.09e-20 / 2.71e-20) over one order of magnitude of
+      spread. A quantity that moves this much under numerically reasonable
+      choices is not a measurement yet.
+
+      **No `junction_capacitance()` FUNCTION IS SHIPPED, deliberately.** One
+      was written, run, and withdrawn in this session. It worked, and that
+      was the problem: a clean callable that returns an unconverged,
+      path-dependent number is exactly what invites a successor to quote
+      `C = 2.7e-20 F` as a result. The measurement stands as a RECORD here;
+      the code arrives with the convergence study that makes it a
+      capacitance. `tests/test_transient_pulse.py` therefore carries no
+      capacitance test, because a skipped test that cannot pass is noise.
+
+      **ANSWERED (2026-11-11, later the same day): Q_top DECREASES ROUGHLY
+      LIKE 1/n_z OVER THIS RANGE, and the "74 % drop" was that decrease
+      measured mid-range. Q_inf is UNESTABLISHED** -- the phase-2 five-point
+      refit (below) puts it anywhere in 3.9--6.9e-21 C, so the 1/n_z form is
+      a description of these points, not a law that can be extrapolated to
+      n_z -> infinity. The lead asked where terminal charge is integrated, on the
+      hypothesis that mesh-dependence of Q at fixed bias might be the single
+      cause behind both the balance and the capacitance failures. It is not.
+      Two separate facts were conflated:
+
+      *WHERE IT IS INTEGRATED.* `simple_physics.CreateSiliconPotentialOnlyContact`
+      installs `edge_charge_model="contactcharge_edge"` =
+      `Permittivity*ElectricField`, summed over the contact's edges with
+      `EdgeCouple`. It is a **surface flux integral (Gauss law)**, NOT a
+      volume integral of node charge. So `get_contact_charge` and
+      `sum(NetCharge * NodeVolume)` are different quantities and must never
+      be compared. For the record they differ by ~1000x here:
+      `sum_vol = 2.31e-10` cm^3 (a volume) gives `sum_netq_vol = 8.86e-16`
+      while `Q_top = 1.31e-20`. That gap is not an error; it is the
+      difference between a flux and a volume integral. The region integral is
+      in turn dominated by `IntrinsicCharge` = `kahan3(IntrinsicHoles,
+      -IntrinsicElectrons, NetDoping)` = **-6.2e12**, with the mobile
+      `NCharge`/`PCharge` = -1.33e-12/+1.33e-12 cancelling it to 8 digits.
+      Doping is carried uncompensated in that node model; the 1e-12 residual
+      is genuine catastrophic cancellation and is why the volume route is
+      useless for charge-balance work at these scales.
+
+      *IT CONVERGES.* Guarded solves (`_solve_at_bias` -> `_solve_converged`,
+      which raises `EquilibriumNotReached`), fine ramp
+      (0.01,0.02,0.04,0.06,0.08,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50 V),
+      n_r=2, measured at 0.35 V:
+
+          n_z     Q_top (C)     Delta from previous
+           50   3.150239e-20        --
+          100   1.310276e-20    +1.840e-20
+          200   9.301640e-21    +3.801e-21
+          400   8.021586e-21    +1.280e-21
+          800   7.514059e-21    +5.075e-22
+
+      Q(n) = Q_inf + c/n fits the last three points EXACTLY (lstsq residual
+      5e-45): **Q_inf(0.35 V) = 6.87e-21 C**. The n_z=100 -> 200 step the
+      reviewer and lead saw is the visible tail; every n_z=100 value is
+      uniformly **2.0x** its extrapolated limit, which is why 100-vs-200
+      looked like a 29 % failure rather than a smooth law. A coarse ramp
+      (0.05 V first step) DOES fail to converge on a fresh device -- that is
+      where the earlier "RelError 1.00" lines came from, not from the mesh.
+
+      *CAPACITANCE, NOW CONVERGED.* Same guarded ramp, C = dQ/dV over 0.10 V
+      spans at the same fixed biases:
+
+          n_z    C@0.25      C@0.35      C@0.45
+          100  2.606075e-20 3.360726e-20 4.293633e-20
+          200  1.855304e-20 2.397817e-20 3.069738e-20
+          400  1.601185e-20 2.070591e-20 2.652258e-20
+          800  1.500156e-20 1.940222e-20 2.485602e-20
+
+      Extrapolated (Q_inf + c/n, rms error <= 8e-22):
+      **C_inf = 1.289e-20 (0.25 V), 1.670e-20 (0.35 V), 2.142e-20 F (0.45 V)**.
+
+      FIVE-POINT REFIT (lead's instruction, 2026-11-11 12:57Z), beside the
+      three-point fit above rather than replacing it. Fitting ALL FIVE n_z
+      points instead of the last three:
+
+          quantity     3-point (last 3)    5-point (all)     spread
+          Q_top@0.35   6.874e-21 C         3.927e-21 C       43 %
+          C@0.25       1.373e-20 F         1.289e-20 F       6.1 %
+          C@0.35       1.777e-20 F         1.670e-20 F       6.0 %
+          C@0.45       2.277e-20 F         2.142e-20 F       5.9 %
+
+      Computed with lstsq over n_z = 50/100/200/400/800 (Q), 100/200/400/800
+      (C). >>> THE 2.13x RISE BELOW IS UNQUOTABLE (2026-11-12). It is a
+      `get_contact_charge` measurement ratioed against a box-length
+      parallel-plate constant; both parts were wrong. Corrected: against the
+      depletion capacitance the converged half-device volume integral gives
+      0.65-0.77x C_dep and is FLAT across bias (see the stop-point block at
+      the end of 2.8 and `2.8-charge-probe.md`). The sentence is kept as the
+      record of the reading, not as evidence. NOTE the 3-point C column here
+      is 1.373/1.777/2.277e-20, which
+      differs from the 1.289/1.670/2.142e-20 recorded above; the earlier
+      figures came from a fit line whose provenance I did not keep, so the
+      numbers in THIS table are the ones with a reproducible script, and the
+      earlier ones should be treated as approximated.
+
+      THE 5-POINT REFIT UNDERCUTS THE THREE-POINT CLAIM, and this is the
+      point of doing it. The 5-point Q_top fit has rms residual 2.14e-21 on
+      a 3.93e-21 answer -- 55 % of the value -- so the 1/n_z form does not
+      hold across the full range (the n_z=50 point is far outside its
+      asymptote). **Q_inf(0.35 V) is therefore UNESTABLISHED**: it lies
+      somewhere in 3.9--6.9e-21 C depending on the fit, i.e. a factor 1.75.
+      The earlier "fits the last three points EXACTLY (residual 5e-45)"
+      sentence above is true only because three points and two parameters
+      leave one degree of freedom -- it is arithmetic, not evidence.
+
+      C_inf is far more robust: the 5-point and 3-point fits agree to ~6 %
+      and the 5-point residuals are ~6e-22 on ~1.7e-20, i.e. 4 %. So
+      **C_inf = 1.29/1.67/2.14e-20 F at 0.25/0.35/0.45 V, good to ~6 %**.
+      The ratio gap against the geometric reference is UNESTABLISHED to
+      that same ~6 % and is quoted below as a 20x--54x band, not a measured
+      constant.
+      The bias trend SURVIVES extrapolation -- C rises ~1.66x from 0.25 to
+      0.45 V, the direction a forward-biased junction takes as the depletion
+      width shrinks -- so that qualitative claim was never at risk. The
+      MAGNITUDE was: every number recorded above the extrapolation block
+      (2.286e-20 ... 4.838e-20 on the unguarded probe) is ~2-3x high, and the
+      "4.32e-20 / 3.09e-20 / 2.71e-20 spread" is the same convergence tail,
+      not three independent discretisations disagreeing.
+
+      >>> ANNOTATION 2026-11-12 -- this whole block (through ~1924) is
+      UNQUOTABLE. The quantity it measures, `get_contact_charge`, does not
+      converge on this mesh (see the retraction at ~2176, factor ~9577 across
+      the z sweep); the reviewer has withdrawn their `f3c9453`/`aa24d37`
+      endorsement. Kept as the record of how the reading was arrived at, not
+      as evidence. Pointer: ~2176.
+
+      MECHANISM, WHY THE TWO CHARGES ARE NOT THE SAME OBJECT (the sentence
+      the lead asked for): the terminal charge is a **surface flux** --
+      DEVSIM assembles it from `contactcharge_edge = Permittivity *
+      ElectricField` integrated over the contact's edges with an EdgeCouple
+      (area-like) weight, i.e. a Gauss-law surface integral -- whereas
+      `sum(NetCharge * CylindricalNodeVolume)` is a **volume integral of an
+      uncompensated doping-minus-carrier density** dominated by
+      IntrinsicCharge (-6.2e12 against mobile terms ~1.3e-12, a cancellation
+      to 8 digits). Comparing them is comparing Gauss's law at a surface to
+      the total space charge enclosed; they agree only if the volume truly
+      encloses all of it. So the balance test must use the terminal charge
+      against dQ/dt, and the volume integral is unusable at this scale.
+
+      **>>> THE LAST SENTENCE OF THE ABOVE IS WITHDRAWN (lead + reviewer,
+      2026-11-12).** The geometry sentence is right -- a contact flux is not a
+      volume sum -- but its INSTRUCTION was "wire the balance to the terminal
+      charge", and `get_contact_charge` is exactly the quantity that does not
+      converge (retraction at ~2176; factor ~9577 across the z sweep). The
+      reviewer verified `eps*E*A = 6.734e-18` and the non-convergence
+      independently. So: the volume integral is dead as a target (the
+      IntrinsicCharge/mobile cancellation is 8 digits) and the flux is dead as
+      a target on this mesh too. What survives is only the negative claim --
+      **there is no reliable electrode charge from either measurement yet** --
+      and the balance must be wired to NEITHER until the C++ assembly is read.
+      No test enforces the withdrawn reading (checked 2026-11-12: nothing in
+      `tests/test_transient_pulse.py` ties `_contact_charge_coulombs` to
+      `get_contact_charge`). One nearby risk is real and is recorded here so
+      it is not mistaken for the same thing: the SKIPPED 2.8 test
+      (`test_junction_capacitance_depends_on_radial_resolution`, body raises
+      `AssertionError("UNFIXED 2.8")`)
+      does assert that C differs by more than 5% between n_r=2 and n_r=4, and
+      its probe uses `devsim.get_contact_charge`. Un-skipping it would demand
+      that a NON-converging quantity move with n_r. It must stay skipped, and
+      its 5% threshold must be re-derived on a converging measurement, before
+      it is ever enabled.
+
+      STILL OPEN, and it is the real question: C_inf ~ 1.7e-20 F against the
+      parallel-plate reference -- CORRECTED, my earlier 4.43e-19 F was
+      wrong. The mesh is a half-disk swept through 2*pi, so the electrode
+      area is the FULL disk pi*r^2 = 5.0265e-11 cm^2 (not the half-disk
+      2.51e-11). The reference is now PINNED by
+      scripts/elec28_capacitance_fixture.py, which reproduces the recorded
+      charges below to all seven digits and prints the geometry it used:
+      r_max = 4.0e-6 cm, L = 6.0e-5 cm (its +/-3.0e-7 m box), so
+      **C_pp = 8.678486e-19 F**. Measured ratios against that reference:
+      0.0300 / 0.0387 / 0.0495 at 0.25 / 0.35 / 0.45 V (n_z = 100) and
+      0.0185 / 0.0239 / 0.0306 (n_z = 400), i.e. **20x--54x LOW, and the
+      deficit WIDENS with bias**. (A still earlier draft used L = 5.88e-5
+      from a +/-2.94e-7 box, giving 8.8556e-19 F and a 19x--40x band; that
+      does not match the pinned fixture and is superseded.) Not
+      explained by n_z convergence (the extrapolation only moves the
+      measurement ~2x), and not explained by a series neutral-region term
+      either -- (1/C_j + 1/C_neutral)^-1 comes out 8.856e-19 F flat to 4
+      digits at every bias because the neutral term dominates, whereas the
+      measurement rises 2.13x over the same range [UNQUOTABLE -- see the
+      marker above]. A real junction
+      capacitance should approach the geometry-limited value from BELOW only
+      where the depletion region fills the gap; here L = 588 nm with
+      N_A = N_D = 1e17 cm^-3, so the depletion width at these biases is a
+      small fraction of L and the series result should be dominated by the
+      dielectric in series with the whole gap -- i.e. near the parallel-plate
+      value, not the measured 20x-54x under it (this sentence said "26x"
+      before the reference was pinned; the conclusion is unchanged).
+      That discrepancy is the next defect to chase;
+      it is NOT the mesh, and the capacitance entry must not be closed until
+      it is understood.
+
+      (5) TWO DIFFERENT CHARGE QUANTITIES WERE BEING COMPARED, and this is
+      the answer to "which one is Q_top". Read from the code path
+      (2026-11-12), not argued:
+
+        * `scripts/elec28_capacitance_fixture.py:93` measures
+          `devsim.get_contact_charge(contact="top", equation="PotentialEquation")`
+          -- DEVSIM's C++ contact assembly of `contactcharge_edge` =
+          `Permittivity*ElectricField` over the contact's edges, i.e. a
+          SURFACE FLUX (Gauss law). Every Q_top and C=dQ/dV number in this
+          entry came from that.
+        * `mse_axisymmetric.py:1563 _contact_charge_coulombs`, used by
+          `transient_pulse` at :1708 and :1728 for the balance series `q_out`,
+          measures `sum q*(p-n)*CylindricalNodeVolume` over the whole
+          silicon -- a VOLUME sum of MOBILE charge, with the fixed dopant
+          deliberately excluded.
+
+      So the capacitance work and the transient balance have been measuring
+      different objects all day: a surface flux at one contact versus a
+      volume-integrated mobile charge over the region. They need not agree,
+      and the earlier "why do these not match" confusion (the 1e-15 C vs
+      1e-20 C scale clash) was at least partly this, not physics. Any
+      comparison or balance test must name which one it uses; the natural
+      choice for a charge balance `I dt = dQ` is the CONTACT (surface) charge,
+      since that is what enters the terminal current integral -- but
+      `transient_pulse` currently uses the volume one, so making the balance
+      use the same quantity as the fixture is a CODE CHANGE that has NOT been
+      made. Recorded as the next action, not claimed as done.
+
+      What a successor should NOT do: re-derive mesh convergence of Q_top or
+      C. `scripts`-less probes for this are
+      `probe_qconv.py` / `probe_cnz.py` (per n_z, guarded) and the fit is
+      three lines of lstsq. Reproduce, do not re-argue.
+
+      PINNED FIXTURE (in the repo, so this survives the scratch probes).
+      `scripts/elec28_capacitance_fixture.py` rebuilds the device, ramps
+      through `_solve_at_bias` (guarded), and prints Q_top and dQ/dV with
+      the reference it computed. It REPRODUCES the table above exactly:
+      at n_z=100 it gives Q_top(0.35) = 1.310276e-20 C and
+      C(0.35) = 3.360726e-20 F; at n_z=400, 8.021586e-21 C and
+      2.070591e-20 F. Same to all seven digits, which is what makes it a
+      fixture rather than a re-enactment. Run it with the devsim
+      interpreter plus the repo's numpy:
+
+          DEVSIM_MATH_LIBS="libblas.so.3:liblapack.so.3" \
+          PYTHONPATH=$PWD/.venv-mse/lib/python3.12/site-packages \
+            /tmp/devsim-probe/bin/python scripts/elec28_capacitance_fixture.py 400
+
+      THE TRAP THAT MADE THIS NECESSARY: the first draft of the fixture
+      omitted `refine=1.0e-9, refine_halfwidth=5.0e-8` and used a
+      +/-2.94e-7 box. It ran clean and gave C(0.45) = 6.76e-20 F against
+      the record's 4.29e-20 F -- a ~1.6x different device that LOOKED like
+      a reproduced result. The junction refinement changes the charge
+      materially; a fixture that omits it is measuring something else. If
+      a future run of this script disagrees with the numbers above, check
+      the refinement FIRST.
+
+      **SEED PROBE RE-RUN (the row asked for it: the reviewer accepted the
+      correction on reasoning, not measurement).** `probe_seed8.py`, fine
+      ramp to 0.30 V, guarded, seed offset parsed as float:
+      dphi = 0.00 / +0.02 / -0.02 / +1.00 V all give
+      intI = -4.6525e-27 A, dQ = 0.0000e+00 C, finalI = -2.3263e-15 A --
+      identical to every digit. A seed offset of a volt does not move the
+      transient solution, so the start state cannot be the defect and the
+      earlier "wrong seed" run was the `int()`-parse bug, now measured rather
+      than argued. NOTE for anyone re-running: the seed probe MUST use the
+      fine ramp. A 0->0.30 V jump raises `EquilibriumNotReached` before the
+      seeding code is reached, which reads as "the probe fails" when it is
+      the drive that fails.
+
+      **ANSWERED: the 1.7e-3 -> 4.3e-6 A decay is NOT PHYSICAL. It is a
+      bdf1 half-step artefact.** The row asked: physical, or an integrator
+      artefact -- try a finer dt and a higher-order integrator. Both were
+      done (`probe_dtint.py`; step from a converged 0.30 V state to 0.32 V,
+      six steps, `charge_error=0.2` so the step is accepted the same way the
+      shipped function accepts it). `Iseries = 0.5*(I_top - I_bottom)` after
+      each step:
+
+          k     bdf1 2e-12    bdf1 2e-13    bdf1 1e-11    tr 2e-12
+          0     1.7355e-03    4.9405e-03    4.5404e-04    2.6917e-03
+          1     5.0666e-04    3.8344e-03    3.5275e-05   -2.9438e-04
+          2     1.5277e-04    3.0280e-03    2.8278e-06    1.0161e-04
+          3     4.6534e-05    2.4190e-03    2.2853e-07   -6.0958e-05
+          4     1.4219e-05    1.9470e-03    1.8506e-08    3.9659e-05
+          5     4.3492e-06    1.5745e-03    1.4994e-09   -2.6014e-05
+
+      Two independent failures of the physical reading:
+      (i) **dt-dependence.** Changing dt by 5x (2e-12 -> 2e-13) changes the
+          FIRST-step current by 2.8x. A dielectric relaxation current is set
+          by the device, not by the step size; if it were physical these
+          columns would agree at k=0.
+      (ii) **`transient_tr` OSCILLATES IN SIGN.** Trapezoidal steps give
+          -2.94e-04, +1.02e-04, -6.10e-05, +3.97e-05, -2.60e-05 -- alternating,
+          decaying ~2.5x per step. bdf1's smooth monotone decay to 4.3e-6 A
+          is the BDF1 damping of exactly this oscillatory mode, not the decay
+          of a physical current. A real relaxation does not change sign.
+
+      Consequence: the "six orders apart" gap between `0.5*(I_top-I_bottom)`
+      and `dQ` is NOT a conservation defect in the physics. It is the
+      transient integrator on a 0.02 V hard step. So DEVSIM's
+      `Charge Relative Error` = 8.9e-2 on that step is reporting a REAL
+      integration problem, and the 1% balance test cannot close while the
+      step is driven as a jump.
+
+      This does NOT close the balance and must not be read as closing it. It
+      relocates the problem: the item to fix is HOW the transient is driven,
+      not the charge accounting. The untested cure remains small DC
+      increments rather than a hard step -- untested is still true of a
+      RAMPED TRANSIENT (every probe above still starts from a converged state
+      and then steps the bias in one go). What is now excluded is the
+      hypothesis that the device or the balance equation is wrong.
+
+      **Two wrong baselines were raised and retracted in this same session;
+      do not resurrect either.** (i) A "1e4x-too-small volume" came from
+      comparing a HALF-DISK against a mesh whose lines span the full radius --
+      `build_grid` uses `r_lines = linspace(0, r_max, n_r)`, so n_r=2 is the
+      axis plus the outer edge and the half-disk IS the right baseline.
+      (ii) A "1e6x" figure came from recomputing the geometry in SI metres
+      while `_build_dd_device` builds the mesh in CENTIMETRES (`M_TO_CM=100`);
+      r_max=4e-8 m is x=4e-6 in the mesh. Standalone DEVSIM cylindrical
+      weighting was checked in isolation and is CORRECT: a bare `create_2d_mesh`
+      cylinder gives sumCylindricalNodeVolume = 2.01e-15 against the analytic
+      half-disk 1.51e-15, and the per-node ratio CylindricalNodeVolume/
+      NodeVolume = 1.6755e-05 against 2*pi*r_max = 2.5133e-05, the 0.667 being
+      the triangular-mesh deficit. **The cylindrical geometry is not a defect.**
+      Read geometry back FROM DEVSIM whenever comparing volumes.
+
+      **UNITS AND AXISYMMETRIC SCALING CHECKED FIRST (2026-11-11, lead's
+      instruction: rule out units before suspecting physics).** Two of the
+      three suspects are CLEARED, measured rather than argued:
+
+      (1) PERMITTIVITY. `_build_dd_device` sets Permittivity from
+      `eps_s * EPS0_CM` with EPS0_CM = 8.854e-14 F/cm against a CM mesh
+      (`M_TO_CM = 100` converts `build_grid`'s metres). Read back from DEVSIM
+      at eps_s = 11.7: **Permittivity = 1.0359399740976e-12 F/cm**, which is
+      11.7 * 8.854e-14 to every digit. Correct, and on ONE unit system.
+
+      (2) CONTACT/ELECTRODE AREA (the 2*pi*r weighting). The mesh is a
+      half-disk (`r_lines = linspace(0, r_max, n_r)`) swept through 2*pi, so
+      the analytic electrode area is the FULL disk pi*r^2 = 5.026548e-11 cm^2
+      at r_max = 4e-6 cm. Measured as sum(CylindricalNodeVolume)/L, the
+      discrete area converges to that reference from above as the radial
+      direction is resolved:
+        n_r   2 -> 6.483853e-11 (ratio 1.2899)
+        n_r   3 -> 5.673371e-11 (1.1287)
+        n_r   5 -> 5.268130e-11 (1.0481)
+        n_r   9 -> 5.065510e-11 (1.0078)
+        n_r  17 -> 4.964200e-11 (0.9876)
+        n_r  33 -> 4.913545e-11 (0.9775)
+      First order, converging to 1.0. **The cylindrical area weighting is not
+      a defect either.** (The n_r=2 excess of 29 % is purely the one-column
+      discretisation, not the gap defect. An earlier "26x" here is struck:
+      it came from the wrong 4.43e-19 F reference, superseded above.)
+
+      (3) THE REFERENCE ITSELF WAS WRONG. The "parallel-plate 4.43e-19 F" I
+      quoted at the last handoff was a coincidence of two cancelling errors:
+      the correct full-disk reference is eps0*eps_r*A/L =
+      **8.855598e-19 F**, and I had halved it for a half-disk whose area does
+      NOT get halved (the 2*pi sweep re-fills it). Recomputed properly and
+      compared against a guarded, converged measurement at n_z=400, n_r=2:
+        V       Q_top (C)      C=dQ/dV (F)   ratio to 8.856e-19
+        0.10    5.858122e-21
+        0.20    8.081424e-21   2.223302e-20  0.0250
+        0.30    1.097154e-20   2.890116e-20  0.0325
+        0.40    1.469070e-20   3.719162e-20  0.0418
+        0.50    1.943393e-20   4.743230e-20  0.0533
+      So the gap is low, and it WIDENS with bias. The units are right and the
+      reference is now right; the deficit is real. SUPERSEDED ON THE
+      MAGNITUDE: the 8.855598e-19 F used in this table came from an
+      L = 5.88e-5 box that the pinned fixture does not use. The fixture pins
+      L = 6.0e-5 and C_pp = 8.678486e-19 F, giving 20x-54x at these same
+      biases (see the block above at ~1905, which is the authoritative one).
+
+      (4) WHY PARALLEL-PLATE IS THE WRONG MODEL HERE, and it does not save the
+      measurement. W(V) runs 94.0 -> 70.4 nm over 0.15-0.45 V against a 588 nm
+      device, so most of the column is neutral series material. The series
+      model C = (1/C_j + 1/C_neutral)^-1 with C_j = eps*A/W and
+      C_neutral = eps*A/(L-W) gives series capacitance **8.856e-19 F at every
+      bias** -- flat to 4 digits, because the neutral term dominates
+      completely. The measurement RISES 2.13x over the same range. So the
+      measurement does not match parallel-plate OR series; the bias dependence
+      is unexplained by either textbook model. That is the open defect.
+      >>> ANNOTATION 2026-11-12: the bias-slope and magnitude statements in
+      (2)/(3)/(4) above are UNQUOTABLE -- they rest on `get_contact_charge`,
+      which does not converge (retraction at ~2176). Kept, not deleted.
+
+      (5) A PROBE OF MINE WAS INVALID AND IS WITHDRAWN. I built a synthetic
+      `ymid` edge model to identify the contact's edges and read E = 0 on all
+      7 "top-contact" edges; that was MY broken edge model
+      (`edge_from_node_model` did not create the `y` edge model I then
+      referenced), not a property of the device. Withdrawn, not recorded as a
+      finding. Same error class as (3): a bad instrument read as a strange
+      world.
+
+      (6) STILL UNEXPLAINED, and the next thing to measure: C is BIT-IDENTICAL
+      (3.90730e-20 F, 6 digits) for n_r = 2, 4, 8, 16 even though the mesh
+      genuinely gains radial columns (verified: x takes 2/4/8/16 distinct
+      values). A resolved physical quantity cannot be independent of the
+      radial discretisation. That independence points at the CONTACT
+      ASSEMBLY (which nodes the contact carries and how their edge charge is
+      weighted) rather than at the silicon solution -- and it is the same
+      place the balance work pointed. Not yet established.
+
+      ONE BOUNDED CONTACT-ASSEMBLY PASS (2026-11-12, lead-authorised, spent).
+      It did NOT explain (6), and it found a bigger, sharper defect. Records
+      both so the next seat starts from the measurement, not the theory.
+
+      (6a) THE INVARIANCE IS REAL, AND IT IS NOT A CONTACT-NODE ARTEFACT.
+      The contact plane is built with `xl=x[0], xh=x[-1]` (the full radius), so
+      it does gain nodes as n_r grows. DEVSIM's mesh log, top contact:
+      n_r=2 -> 2 nodes; n_r=4 -> 4 nodes; n_r=8 -> 8 nodes. Equations 366 ->
+      732 -> 1464. Every solve is guarded (`_solve_converged`) and converged,
+      so the identical charge is not a stale or unconverged state.
+
+      (6b) WHY: THE DEVICE IS EXACTLY ONE-DIMENSIONAL. Sampling Potential and
+      Electrons at the same z on every radial column gives identically equal
+      values at all printed digits, for every n_r. The radial direction is
+      decoration; the solution genuinely depends on z alone. That is WHY a
+      properly-weighted cylindrical integral comes out n_r-independent --
+      (6a) is a symptom of the solution being 1-D, not of a broken contact.
+      This retires the contact-assembly hypothesis for (6).
+
+      (6c) THE ACTUAL DEFECT, AND IT IS THE ONE THAT MATTERS. On the same
+      converged states, at V=0.35:
+
+          z points    Emax (V/cm)     Q=get_contact_charge    eps*E*A
+          84          1.2933e5        8.306e-17               6.73e-18
+          168         1.2934e5        9.007e-19               6.73e-18
+          336         1.2933e5        4.354e-20               6.73e-18
+          672         1.2934e5        1.391e-20               6.73e-18
+          1344        1.2933e5        8.673e-21               6.73e-18
+
+      Emax is CONVERGED to 4 digits across a 16x mesh refinement -- the field
+      and the silicon solution are right and stable. `Q` is NOT converged: it
+      falls by a factor ~9577 from the coarsest to the finest mesh
+      (8.306e-17 / 8.673e-21, n_z 84 -> 1344; an earlier draft of this block
+      said 777, which is wrong -- lead correction 2026-11-12), still
+      falling at n_z=1344, and shows no sign of a limit. Since A and
+      permittivity are both verified correct (see the units check above), and
+      E is converged, `Q = eps*E*A` MUST be converged. It is not. Therefore
+      `get_contact_charge` is NOT returning the electrode charge on this mesh.
+      THIS RETRACTS the "it converges as 1/n_z" reading in the phase-2 blocks
+      above: the sequence was decreasing roughly like a power and the 5-point
+      fit mistook the tail for a limit.
+
+      (6d) WHAT `Q` IS NOT. Two candidate reconstructions were measured and
+      both FAILED to reproduce it, which is itself useful:
+        - edge_charge_model `EField` = (P@n0 - P@n1)*EdgeInverseLength is a
+          FIELD, not a charge, and lives in `_build_dd_device`'s sibling
+          builder (`DField = Permittivity*EField` is the D.n that a contact
+          charge needs). Monkeypatching `DField` in changed `Q` by ZERO digits
+          -- which proved the patch did not reach the call, not that the model
+          is irrelevant. A no-op mutation is indistinguishable from a
+          surviving one; this was checked, not assumed.
+        - sum of `contactcharge_edge * EdgeCouple` over the silicon edges I
+          could query is ANTI-CORRELATED with Q across n_z as first measured
+          (EdgeCouple up x1.22, Q down x0.32). The Q-side factor here is
+          the 777-era one and is unquotable; on the corrected Q the
+          anti-correlation is far stronger, so the conclusion ("Q is not that
+          sum") holds a fortiori. So Q is not that sum over those edges.
+          Whatever DEVSIM sums is on objects `get_edge_model_values` does not
+          expose.
+
+      HANDED UP AS PARTIAL, per the lead's instruction at the top of this pass:
+      if one bounded pass does not explain it, stop. It did not. The next move
+      is a real one and is NOT another start-state theory: read the C++
+      `contactcharge_edge` / `CreateContactEquation` assembly in the DEVSIM
+      source (it is vendored in the solver image) to find which nodes and
+      weights the contact integral actually uses, instead of reconstructing it
+      from Python-side getters. Do not quote any absolute Q or C from this
+      row until that is answered.
+
+      >>> UNQUOTABLE MARKER, 2026-11-12 (lead, after reviewer FAIL on
+      bookkeeping). REVIEWER POSITION, recorded so a later seat does not
+      inherit false confidence: the reviewer verified `eps*E*A = 6.734e-18`
+      independently and verified the non-convergence, so (6c)'s FINDING stands
+      -- but the reviewer WITHDRAWS their earlier endorsement of `f3c9453` and
+      `aa24d37`, the two commits that quoted absolute Q and C. Treat every
+      absolute charge and capacitance in the phase-2 blocks above (including
+      the 20x--54x gap against `C_pp` and the 2.13x bias slope) as UNQUOTABLE
+      until the C++ contact assembly is read and the electrode charge is
+      computed independently. This marker is the forward pointer: the blocks
+      at ~1900--1924 (see the two inline ANNOTATION lines) saying "the deficit
+      is real", "20x--54x LOW", and "RISES 2.13x" now point HERE. They are kept, not deleted (lead instruction),
+      but they rest on a quantity this block shows does not converge, so they
+      are the retracted reading and this block supersedes them. The reviewer's
+      verification of `eps*E*A` and of the non-convergence is NOT withdrawn.
+
 - [ ] 2.9 `scripts/dd_bench.py`. Prove the central-difference, dropped-2πr and
       table-priced refusal mutations.
+      **PARTIAL 2026-11-12 (`qitem-20261112102258`, branch elec-sic-materials-fill).
+      2 of 3 caught; the third SURVIVED and the survivor is a real defect, not
+      a broken bench.** The box stays UNTICKED: the row's done-condition is
+      "box ticked only if all three are caught".
+      Script: `scripts/dd_bench.py`, one subprocess per case (DEVSIM's mesh
+      registry is process-global), mutations applied by monkeypatch only.
+      Every number below is from the script's printed output.
+
+      | mutation | check that caught it | reference | mutated | verdict |
+      |---|---|---|---|---|
+      | central-difference flux | `_solve_converged` (`EquilibriumNotReached`) | `converged=True`, `I_top=4.850859e-13 A` | `converged=False`, hole-continuity residual 1.164e+03 | CAUGHT |
+      | dropped 2πr | none — **survived** | `w_measured=8.770540e-08 m`, `NodeVolume sum=1.980132e-10` | bit-identical; `NodeVolume sum=1.980132e-10`, `CylindricalNodeVolume` ABSENT | SURVIVED |
+      | table-priced refusal | `EstimateError` from `estimate_memory` | refused: "not been measured above 112,847 free unknowns" | returned `5.030064e+09` bytes | CAUGHT |
+
+      Reproduce (solver image, tiny cases):
+      `docker run --rm --cpus=2 --memory=2g -e DEVSIM_MATH_LIBS="libblas.so.3:liblapack.so.3"
+      -e PYTHONPATH=/repo/dockerfiles/maxwell_solver:/opt/app -v "$PWD":/repo:ro
+      --entrypoint python registry.example/mode-search-engine/mse-solver:devsim-2.1 /repo/scripts/dd_bench.py`
+      (case 3 alone needs no DEVSIM: `python scripts/dd_bench.py --case memref`
+      runs both sides in-process). Exit code is 1 when any mutation survives.
+
+      **WHY THE 2πr MUTATION SURVIVED, measured:** `cylindrical_node_volume` and
+      `cylindrical_edge_couple` do NOT overwrite `NodeVolume` / `EdgeCouple`.
+      DEVSIM logs "Replacing Node Model CylindricalNodeVolume" and writes NEW
+      models under the `Cylindrical*` names. Patching both calls out leaves
+      `NodeVolume` bit-identical (1.980132e-10 in both columns) and the solve
+      bit-identical to 16 digits. The quantity that does move is the model that
+      disappears: `CylindricalNodeVolume` sums to 8.294358e-16 in the reference
+      and is ABSENT in the mutant.
+
+      **THE DEFECT THIS EXPOSES (pre-existing, not introduced here).** The
+      equations and the integrators ask for DIFFERENT measures:
+      - `PotentialEquation` is assembled with `edge_volume_model="EdgeCouple"`
+        (mse_axisymmetric.py:832) — the BARE, PLANAR coupling;
+      - `_contact_charge_coulombs` (:1604) and `_recombination_per_second`
+        (:1633) integrate over `CylindricalNodeVolume` — the CYLINDRICAL one.
+      On the 2.8 solve mesh the two differ by ~4 orders of magnitude:
+      `NodeVolume` sum 7.263333e-10 against `CylindricalNodeVolume` sum
+      1.216983e-14; and the mesh's own volume is 0.990063 x `r_max*L`, i.e. the
+      planar strip, against a full-swept-disk volume of `pi*r^2*L`. So the
+      Poisson solve has been PLANAR while the charge integral has been
+      CYLINDRICAL, in every axisymmetric solve in this change.
+      This is the best candidate yet for the 2.8 charge imbalance and for
+      `get_contact_charge` not converging, because `Σ q(p-n)·V_cyl` cannot
+      balance a solution whose Poisson equation used `EdgeCouple`.
+
+      **NEEDS THE LEAD (`qitem-20261112102258`):** fixing it means changing which
+      measure the equation uses, which moves EVERY solved number in 2.3--2.8 —
+      V_bi, the depletion width, every charge and capacitance. 2.9's own limits
+      forbid this bench from touching solver source, and the change is far
+      outside 2.9's scope. The 2.8 UNQUOTABLE markers therefore stay in place:
+      the numbers are not merely unverified, they were computed on a mixed
+      measure. Recommend the lead open this as its own row against 2.3, before
+      anything else in the electrical-simulation change quotes an absolute
+      charge.
+- [x] 2.11 Solvers read material parameters THROUGH the citing gate, not around
+      it. Reviewer finding 1 (2026-11-10): `require_cited_parameter` checked that
+      a cited value EXISTS in the library and returned None, so `sweep_diode_iv`,
+      `solve_multi_terminal` and the other two callers went on using their own
+      `eps_s` argument. A caller could pass a hand-typed eps_s and still clear
+      the gate.
+      **DONE 2026-11-11 (`qitem-20261111101126`, branch elec-materials-gate).**
+      `require_cited_parameter` now RETURNS the cited value, and a new
+      `material_value(material, name, override=None)` wraps it: it returns
+      `(value, source)` where source is `"library: <material>.<name>"` or
+      `"override(<material>.<name>)"`. All FIVE solvers that take a material
+      (`solve_abrupt_junction_dd`, `solve_abrupt_junction`, `sweep_diode_iv`,
+      `solve_multi_terminal`, `solve_layered_dd_3d`) now assign `eps_s` from it,
+      their `eps_s` keyword defaults to None, and each returns `eps_s` and
+      `eps_s_source` so an override is reported rather than inferred.
+      A caller-supplied eps_s is therefore an EXPLICIT, recorded override; it
+      can never again be a silent default. A gap or a refusal still raises
+      even when the caller supplies a number (cite-or-refuse outranks the
+      override) -- `test_a_gap_is_refused_even_when_the_caller_supplies_a_number`.
+      Tests: `tests/test_material_value_gate.py` (9). Mutation-proved: restoring
+      any one solver to a bare `require_cited_parameter` fails
+      `test_every_solver_that_takes_a_material_reads_eps_s_through_the_gate`,
+      naming that solver. The converse is asserted too: `_build_device` must NOT
+      re-resolve, because a second gate would silently discard an entry-point
+      override one level down.
+      NOTE: the library's `resolve()` already returned `(values, sources)` and
+      has no production caller; the defect was only in the solver path.
+- [x] 2.12 `solve_abrupt_junction` (the potential-only path) does not converge. FIXED
+      2026-11-11. The recorded cause above (single solve vs a staged ramp) was WRONG, and
+      the fix it implied would not have worked: a 0.05 V-step bias ramp stalls at the same
+      place. Measured stall was `AbsError 4.09097e-01`, which is exactly V_bi/2.
+      REAL CAUSE: the fixed space charge was `q*NetDoping*1e6` under a comment claiming
+      SI geometry; the `1e6` inflated the charge a millionfold. Dropping it converges in
+      ~9 Newton steps to RelError 5e-14. The sweep, other things equal:
+        Permittivity=F/m,  charge=q*N      -> converged, span 0.8334 V  <-- taken
+        Permittivity=F/m,  charge=q*N*1e6  -> FAIL
+        Permittivity=F/cm, charge=q*N      -> converged, span 36.98 V (wrong)
+        Permittivity=F/cm, charge=q*N*1e6  -> FAIL
+      Consequence recorded, not fixed: this builder sets Permittivity from `EPS0` (F/m)
+      while `_build_dd_device` uses `EPS0_CM` (F/cm), so the two are not on one unit
+      system. Unifying them means re-deriving the 2.3 calibration under `EPS0_CM`, which
+      is a separate change with its own numbers to re-validate.
+      V_bi now agrees with `solve_abrupt_junction_dd` to 0.14 % (0.833370 vs 0.834505 V).
+      DEPLETION WIDTH IS NOT ACHIEVABLE BY THIS MODEL and no attempt was made: with no
+      electron/hole continuity there are no carriers to screen the field, so the potential
+      ramps across the whole domain (far-field slope 3.0e5 V/m, measured) and the 10-90 %
+      transition reads 1.82e-6 m against the coupled solver's 8.77e-8 m on the same grid.
+      The number is still returned, for the size-wiring test that uses it as a cheap
+      fixture; its docstring and `tests/test_po_junction_convergence.py` both say it is
+      not a physics result. A real depletion width needs the coupled path.
+      Two unit bugs fixed alongside: the width was measured on the raw cm axis and
+      compared against a metre-valued analytic width (a 1239x phantom error), and the
+      result dict now returns `z` (metres) and `phi` like the coupled solver so the two
+      can be compared sample-by-sample. Tests: 6 new, mutation-proved by restoring `1e6`
+      (all fail with the original Convergence failure).
+- [ ] 2.13 A memory-priced gate cannot refuse a mesh that is too ill-conditioned to
+      factor. Found 2026-11-10 reproducing 2.7's 5.0e-8 failure locally: the coupled
+      solve dies in `umfpack_di_numeric` ("umfpack numeric failed") at peak RSS
+      3.08 GB, while `estimate_tet_job_bytes` prices the same mesh at 5.45 GiB — so
+      the gate ADMITS a run that provably cannot factor, and the peak is BELOW its own
+      price. Raising `resources.limits.memory` does nothing. Admission for this class
+      needs a non-memory criterion: try the factorisation with a bounded retry at a
+      coarser mesh, or gate on pivot growth / condition estimate, or move to UMFPACK's
+      64-bit `dl` variant so the ceiling itself moves. None of these is implemented;
+      2.7 records the gap rather than claiming the refusal path covers it.
+
+      **INTERIM SHIPPED 2026-11-10 (lead decision):** a NODE-COUNT refusal,
+      `TET_MAX_FACTORABLE_NODES = 18957`, raised in `_require_tet_job_memory`
+      BEFORE the memory price. 18,957 is the largest measured to factor (edge
+      6.0e-8, stage 1); 32,430 (edge 5.0e-8, coupled) failed. The true ceiling
+      lies between those two sizes, so the constant takes the known-good end and
+      refuses some meshes that might have solved — a refusal the user can act on
+      beats a six-minute failure inside the numeric factor. The refusal message
+      says "Coarsen the mesh" and states it is a solver-size limit, not a memory
+      limit, so nobody tries raising the Job's memory.
+      Tested twice: `test_a_mesh_over_the_factorable_ceiling_is_refused_before_solving`
+      (mutation-verified — removing the guard fails it) and
+      `test_the_node_ceiling_lies_between_the_two_measured_sizes`.
+      The pre-existing memory-gate test was REPOINTED, not deleted: since this
+      guard no mesh under 18,957 nodes exceeds the 14 GiB default, so it now
+      names an explicit small `limit_bytes` to exercise the memory gate alone.
+      STILL OPEN above, unclaimed: the 64-bit `dl` variant, pivot-growth /
+      condition gating, and a coarser junction mesh. The node ceiling is a
+      stop-gap that refuses without diagnosing.
+
+**2.8 STOP POINT — Option B taken (lead decision, 2026-11-12).**
+**CORRECTED 2026-11-12 after reviewer FAIL: the numbers this block first
+carried (1.80e-19 F, 0.21 C_pp, "~5x low", "seam") are WITHDRAWN.** They came
+from differencing across two n_z (a mesh difference, not a dQ/dV) on
+mislabelled bias columns, against a box-length reference. See
+`2.8-charge-probe.md`, which now shows the arithmetic row by row.
+
+WHAT THE PROBE ACTUALLY ESTABLISHES (all from fixed-mesh dQ/dV):
+
+- **`q_half_top`, the half-device volume sum of mobile charge, is the
+  well-behaved quantity.** Its dQ/dV is 4.256e-18 F (the probe's sign
+  convention makes it negative; the magnitude is the capacitance) and it
+  moves 0.09 % from n_z=84 to 1344 and 0.00 % from 1344 to 5376.
+- **Against the right reference it is 0.65–0.77 x `C_dep`.** `C_dep =
+  eps_s*A/W(V)` is 5.539e-18 F at 0.15 V (W = 94.0 nm) and 6.586e-18 F at
+  0.35 V (W = 79.1 nm), from the device's own N_A = N_D = 1e17, n_i = 1e10,
+  V_bi = 0.833370 V. The measured value is FLAT where `C_dep` rises 19 %, so
+  it does not reproduce the depletion slope. **Cause unknown.** That, not
+  "5x low", is the residual statement.
+- **`get_contact_charge` is a poor capacitance quantity** — 61x below the
+  half-device sum and mesh-tracking — but its fixed-mesh dQ/dV is POSITIVE
+  (+1.677e-20 F at n_z=1344, +1.633e-20 at 5376). The earlier "negative
+  dQ/dV / a capacitance cannot be negative" reading was my arithmetic error
+  and is retracted.
+- **`q_dop_net` is +4.261067e-20 C bit-identically at both biases.** A
+  neutral diode should have this near zero, and it is; but 0.2 V of bias
+  moving NO net charge is an open solve/doping-sign observation for a later
+  look. It is **not** a z = 0 seam and the seam reading is removed: charge
+  neutrality explains the approach to zero, as the lead and reviewer both
+  pointed out.
+- **The parallel-plate constant `C_pp = 8.678486e-19 F` is arithmetically
+  correct** (`eps_s·π·r²/L`, box length L = 6.0e-5 cm, verified line by
+  line) **but is the wrong yardstick** — a 600 nm box against a ~80–95 nm
+  depletion width. Kept only as a labelled mesh constant.
+
+2.8 STILL CANNOT BE CLOSED: no charge identity is asserted anywhere; the
+transient balance remains owed; `q` from `transient_pulse` is labelled a
+STAND-IN in the code. The 20–54x, 5x, 2.13x, 0.207 and 1.80e-19 F figures are
+dead as live claims and must not appear in any successor document.
+
+OWED, unclaimed: (i) why the measured capacitance is flat in bias where
+`C_dep` is not; (ii) the C++ `contactcharge_edge` / `CreateContactEquation`
+assembly, read from the vendored DEVSIM source, to say what
+`get_contact_charge` actually sums; (iii) the skipped 2.8 test's 5 % n_r
+threshold, which still has no justification.
 
 ## 3. Phase 3: coupling into the Purcell runs, and loss
 - [ ] 3.1 The paper-1 bench writes `purcell_spectrum.npz` (via `np.savez`, as the bench already
@@ -1365,3 +2748,194 @@ measured, found inert, and reverted before commit; it never reached a header.
 The two probes spent establishing that cost several calls, most of them
 re-learning what ``mse_meshing`` says three hundred lines from where I was
 working.
+
+### 2.3 axisymmetric (r,z) drift-diffusion (in progress, 2026-11-09)
+
+- [x] The 2πr weighting is available in DEVSIM, but only on a genuine 2-D
+      mesh: ``create_2d_mesh`` + ``raxis_variable``/``raxis_zero``, then the
+      **commands** ``cylindrical_node_volume``/``cylindrical_edge_couple``.
+      They are commands, not expressions. Verified against an analytic disc
+      volume.
+- [x] A contact only registers when a **region of different material** sits
+      under its box; a same-material box yields zero contacts with no error.
+- [x] Every edge model needs its analytic Jacobian companions
+      (``<model>:Potential@n0/@n1``) or the Newton matrix is singular.
+- [x] A 1-D DEVSIM mesh has **no ``y`` coordinate** — it returns 0.0
+      everywhere, so ``init_from="y"`` silently dopes a constant. One of my
+      own probes was undoped this way and reported V_bi = 0.0000 with no error.
+- [x] The coupled drift-diffusion solve converges on the (r,z) mesh, and
+      **V_bi = 0.83450 V vs 0.83337 V analytic (0.136%)**, tested.
+- [ ] The depletion **width** is not yet quotable, and the defect is **not**
+      the carrier contact BC — that correction was tested and does not hold.
+
+**Corrected diagnosis (2026-11-09, after the reviewer's finding 2):** I ran
+the contact-BC hypothesis down and it is wrong, so recording what was
+measured rather than what was assumed:
+
+- The carrier contact BCs **are** satisfied exactly. All four
+  ``Potential``/``Electrons``/``Holes``/``IntrinsicElectrons`` contact node
+  models evaluate to a residual of 0.0 at every contact node. Losing none.
+- The space charge **does** include the carriers. At a neutral node
+  ``PotentialNodeCharge = 1.28e-18`` (e=1e3, h=1e17, nd=-1e17) — genuine
+  cancellation. The model that would break neutrality
+  (``PotentialIntrinsicCharge``, doping only) is not the one in use.
+- The junction **does** screen. With the mesh in centimetres and
+  DEVSIM's own F/cm constants, the whole 0.8345 V drop sits inside
+  ±50 nm; it is localised, not a linear ramp. The earlier "linear ramp"
+  readings were the **metre mesh**: DEVSIM's ``simple_physics`` is a
+  cm-unit model, so a metre grid made the Debye length 1000x too long.
+  That is the unit trap my own notes warned about and I walked into.
+- The width is ~39 nm against 147 nm analytic (ratio 0.266, stable across
+  charge thresholds 0.5/0.2/0.1/0.05/0.02 and across refinement windows).
+  It still tracks the domain: 4.7 nm on ±0.3 um vs 31 nm on ±2 um.
+
+So the open defect is narrower than "the contact BC": the space-charge
+extent is ~3.75x too short and is not domain-independent. Unexplained.
+
+**RESOLVED 2026-11-09 (the width question the lead blocked the merge on).**
+Root cause: **a unit mismatch — the DEVSIM mesh was built in METRES while the
+physics model it was fed is in CENTIMETRES.**
+
+- ``devsim.python_packages.simple_physics`` is a centimetre-unit model
+  (``eps_0 = 8.854e-14 F/cm``, doping in cm^-3). The reference
+  ``diode_common.py`` builds its mesh at 0, 0.5e-5, 1e-5 **cm** for exactly
+  this reason.
+- ``_build_mesh`` was fed a metre grid verbatim into ``add_2d_mesh_line``, so
+  ``EdgeInverseLength`` carried a per-metre scale while every charge term
+  assumed per-cm. ``SetSiliconParameters`` then set ``eps_0`` in F/cm against
+  that metre mesh, making the space charge 100x too weak: the Debye length
+  came out sqrt(100) = 10x too long, 129 nm -> 1.29 um, the size of the box.
+- **The result was not an error message — it was a beautifully convergent
+  wrong answer.** The solve relaxed to a LINEAR potential ramp from contact to
+  contact across the whole domain, with no junction in it. V_bi therefore
+  looked perfect (0.8345 V, 0.14 % from analytic) because it is just the
+  contact-to-contact difference, while W tracked the box because *the box was
+  the entire solution*. Measured profile: flat -0.417 V, straight line, flat
+  +0.417 V.
+- **The fix** is one line: build the mesh in cm. Everything else in the module
+  stays SI (public API, grids, widths) with conversion at the DEVSIM boundary
+  (``_set_net_doping`` converts y cm->m before evaluating the profile; the
+  readout converts z cm->m).~~ **Superseded on one point (2026-11-10):**
+  leaving Permittivity alone is right about the UNIT (the F/cm value is the
+  correct one for a cm mesh) but wrong about the MATERIAL. That block sets
+  `eps_si = 11.1`, DEVSIM's generic silicon, so a caller's cited 11.7 was
+  silently ignored. 2.4 now re-states `eps_s * 8.854e-14 F/cm` and the width
+  moves 2.7 % (8.5404e-08 -> 8.7705e-08, exactly sqrt(11.7/11.1)). See the
+  2.4 entry "WHY 2.4 MOVED A 2.3 NUMBER BY 2.7 %" below. Do not revert it
+  thinking it is the old F/m bug.
+
+**After the fix, measured on the real solve:**
+
+| domain half-width | W_measured | W_analytic x 0.578 | error | V_bi |
+|---|---|---|---|---|
+| +-0.3 um | 8.5404e-08 m | 8.4887e-08 m | 0.6 % | 0.83450 V |
+| +-1.0 um | 8.5404e-08 m | 8.4887e-08 m | 0.6 % | 0.83450 V |
+| +-2.0 um | 8.5404e-08 m | 8.4887e-08 m | 0.6 % | 0.83450 V |
+| +-5.0 um | 8.5404e-08 m | 8.4887e-08 m | 0.6 % | 0.83450 V |
+
+These rows are the measurement as taken at c413e35 and are left as recorded.
+**They are now 2.7 % low in W** (the table's 0.6 % agreement is with the 11.1
+permittivity, not the cited 11.7): with the material value re-stated the same
+solve gives 8.7705e-08 m, which is 3.3 % from the analytic 10-90 % line rather
+than 0.6 %. Domain-invariance is unaffected. See the 2.4 entry below.
+
+W is **identical to five significant figures across a 16.7x change in box
+size** (+-0.3 um to +-5 um: 10/0.6 = 16.7, the same by half-width or full
+width). That is the direct answer to "find why W tracks the box": it tracked
+the box because of the unit bug, and with the unit fixed it does not track the
+box at all. (The separate grid measurement below uses the +-0.3 um to +-2 um
+pair, which is a 6.7x change -- two different comparisons, not one figure
+reported two ways.)
+
+**Two smaller defects found while confirming it (both fixed):**
+
+- **The 10-90 % shape factor was wrong.** The solver's potential transition is
+  LINEAR (constant field), not triangular, because the pinned-carrier DD solve
+  gives a near-constant rho across the transition. Measured W_10-90/W_full =
+  0.5817 at c413e35 (8.540e-08 / 1.468e-07 m, reviewer re-measured in the
+  image), matching the linear value 0.5782 to 0.6 %, not the triangular
+  0.4472. Using 0.4472 manufactured a stable, refinement-independent ~30 %
+  "error" that read as a physics defect. (An earlier draft recorded 0.5927 and
+  32.5 %; neither reproduces on any commit, so both are withdrawn.)
+- **``build_grid``'s far regions had a fixed node count** (``max(2, n_z//3)``
+  each), so their spacing scaled with the domain. That moved the measured
+  width 3.8 % between a +-0.3 um and a +-2 um box *after* the units were right.
+  Now sized by spacing, so node count scales with the region's length.
+
+**Ruled out while chasing this — and one of these I had wrong:**
+the mesh resolution itself (fine), the contact node models (identical in form
+to DEVSIM's ``CreateSiliconPotentialOnlyContact``), and n*p = 1e20 exactly at
+every node (DEVSIM's own built-in convention; its reference diode does the
+same). **I previously recorded "the unit conversion was ruled out because the
+1e6 in the charge term is consistent with F/m permittivity". That was wrong**
+— the conversion was *internally* consistent and simultaneously inconsistent
+with ``simple_physics``, which is what the defect was. A locally consistent
+transcription of a unit bug still reads as consistent.
+
+**A wrong "RESOLVED" note stood here for one wake.** The paragraph that
+previously occupied this space claimed the width was fine, Debye-limited, and
+that "W tracks the box is not a defect — it is the physics", citing the
+reference diode reading 28.6 nm. Those *measurements* were real but were taken
+through the metre-mesh bug, so they described a linear ramp, not a junction.
+The correction: the Debye-width sweep was a description of the broken solve.
+**Lesson: when one suspicion (the metric) is confirmed by comparing against an
+external tool, check that the external tool comparison is not itself running
+the same broken code.** Both sides of my comparison shared the defect.
+
+- [x] Re-measure W on domains from +-0.3 to +-5 um; domain-invariant to 0.6 %.
+- [x] State in the docstring which width is compared to which, and why.
+
+
+- [x] The width test no longer "fails by design". At ``c146290`` the width
+      assertion raised a ``KeyError`` inside an ``xfail(strict=True)`` and so
+      passed as "expected failure". That is now real keys + a hard 10 %
+      assertion, and the suite is 20 passed, 1 xfailed (the known 2.2
+      uncited-parameter xfail). Verified non-vacuous by mutation, re-measured
+      2026-11-09 on the merged tree:
+
+      - metre mesh back (``M_TO_CM = 1.0``): **2 of 5 fail**, the width test
+        and ``test_the_junction_is_not_just_the_box``. The three that survive
+        are ``test_the_coupled_solve_reproduces_the_built_in_voltage``,
+        ``test_the_built_in_voltage_does_not_depend_on_the_domain`` and
+        ``test_the_potential_does_separate_the_two_doping_regions`` -- and
+        they survive *because a linear ramp has the right V_bi too*: the ramp
+        still spans the full drop from contact to contact, so V_bi and "the
+        two sides have different potentials" are both satisfied by the broken
+        solution. That is exactly why the defect hid for a wake: the tests
+        that checked the *magnitude* of V_bi could not see it. Only a test of
+        the width, or of whether the width is the box, can.
+      - triangular shape factor (``0.4472`` instead of ``0.5782``): **1 of 5
+        fails**, the width test, at 30.1 % (measured 8.540e-08 m against the
+        triangular expectation 6.566e-08 m, as printed by the assertion). To
+        keep the quantities apart, since they are easy to conflate: 30.1 % is
+        the *observed failure against the triangular expectation*; 0.6 % is the
+        agreement of the measured 0.5817 with the linear 0.5782; and 29.3 %
+        (0.5782/0.4472 - 1) is the *ratio between the two shape factors*,
+        which is a third number that never appears as a test error.
+
+**Recorded against myself (2.3, wake 4→5):** I spent four wakes probing
+DEVSIM's API by hypothesis when
+``devsim_data/examples/diode/diode_common.py`` had the whole recipe in 60
+lines. Worse, in wake 3 I reported "V_bi = 0.83337 V, 0.0000% error" from a
+potential-only solve whose domain I had sized to about one depletion width —
+a linear ramp of the right length is not evidence of agreement, and I
+retracted it. The lead's two corrections (the reference exists; 1e10 is the
+normal DD tolerance) are what moved this from stuck to working.
+
+**Correction: a "reviewer finding 3" I reported does not exist (2026-11-09).**
+After the 2.3 review I listed an open item -- "the potential error-correction
+factor 300 giving 1.3 um with both contacts at 0 V, sweep ``PotentialError``
+and compare the reference" -- and attributed it to the reviewer. **It is not
+the reviewer's finding and it is not in this tree.** Checked: no
+``PotentialError`` anywhere in ``dockerfiles/`` or ``openspec/``, none in the
+reviewer's own worktree, and none across the last 40 revisions of that worktree
+either. The only occurrence of the string anywhere is in my own post-review
+summary, where I first wrote it.
+
+So there is nothing to fix and no evidence to write down: I cannot say which
+solve, which bias, or what the 300 multiplies, because I do not have a source
+for any of it. Recorded here rather than silently dropped, because "carries an
+unfounded open item in the repo notes" is itself a defect -- it would send a
+later reader hunting for a bug that was never demonstrated. If a real
+PotentialError concern surfaces it gets its own note with a measurement
+attached; this one is withdrawn.

@@ -59,6 +59,13 @@ RUN pip install --no-cache-dir -r /opt/app/requirements.txt
 # assumption that a Job could provision its own schema.
 COPY dockerfiles/maxwell_solver/ /opt/app/
 
+# The 3-D peak-RSS calibration script (task 2.7). It lives at the repo root, not
+# under dockerfiles/, so the COPY above does not pick it up. Carried in the image
+# rather than a ConfigMap so the calibration Job has no moving parts: an earlier
+# version of that Job shipped the script via ConfigMap onto a tag that predated
+# mse_axisymmetric.py entirely, and died on import.
+COPY scripts/dd_3d_rss.py /opt/app/scripts/dd_3d_rss.py
+
 # Run unprivileged: the solver only reads storage and writes results.
 RUN useradd --create-home --uid 10001 mse
 USER 10001

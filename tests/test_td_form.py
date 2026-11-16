@@ -102,11 +102,28 @@ def test_the_form_keys_are_the_workers_request_keys():
     assert TDF.REQUEST_KEYS == td_solve.REQUEST_KEYS
 
 
-def test_a_td_form_queues_a_jetson_td_row_the_worker_can_lay_out(tmp_path):
+def test_a_td_form_queues_a_td_row_following_the_gpu_route_the_worker_can_lay_out(
+        tmp_path):
+    """The row's TARGET follows ``MSE_GPU_ROUTE``; the row's CONTENTS do not.
+
+    This asserted ``target == DB.JETSON`` unconditionally, which was true until
+    2026-11-12: the Jetson went offline and the GPU image gained the same
+    ``td_solve``, so a td upload now follows ``CFG.gpu_route()`` like pc and
+    cavity. The old assertion is kept in ``_targets`` below rather than swapped
+    for the new value, because a test that only ever names the current answer
+    cannot tell a working route from a hardcoded one.
+
+    Everything below the target is route-independent and still asserted: the
+    worker's own reader and layout must accept the stored row whichever machine
+    will run it.
+    """
     resp, db, store, flashes = _post(tmp_path)
     assert resp.status_code == 302, (flashes, resp.data[:400])
     (job_id, job), = db.jobs.items()
-    assert job["kind"] == DB.TD and job["target"] == DB.JETSON
+    assert job["kind"] == DB.TD
+    assert job["target"] in (DB.JETSON, DB.CLUSTER_GPU), (
+        f"a td row went to {job['target']!r}, which has no td solver; the "
+        f"route matrix test below pins which of the two it is")
     assert job["materials"] == {"block": 1.5, "cube": "Au"}
     tds = job["tds"]
     assert tds["frequency_hz"] == _close(450e12)
@@ -134,6 +151,39 @@ def test_a_td_form_queues_a_jetson_td_row_the_worker_can_lay_out(tmp_path):
         assert abs(nodes[i] - 300e-9) <= np.max(np.diff(nodes)) / 2 + 1e-15
     assert set(lay["metals"]) == {"Au"}
     assert job["est_tets"] == int(np.prod(lay["shape"]))
+
+
+@pytest.mark.parametrize("route, expected", [
+    ("cluster", DB.CLUSTER_GPU),
+    (None, DB.CLUSTER_GPU),          # unset: the default is the cluster
+    ("jetson", DB.JETSON),
+    ("something_nonsense", DB.CLUSTER_GPU),
+])
+def test_a_td_upload_is_routed_by_the_setting_not_by_a_hardcoded_machine(
+        tmp_path, monkeypatch, route, expected):
+    """Both answers, driven by the setting, on the REAL upload route.
+
+    Why this exists. A td row was hardcoded to the Jetson in TWO places -- the
+    upload handler and ``db.next_queued``'s whitelist -- so when the Jetson went
+    offline there was no route at all, and changing one place alone would have
+    made it worse: the handler would have created a ``cluster-gpu`` row that
+    ``next_queued`` still refused to see, and the owner's upload would sit in a
+    queue that could never launch it. This test pins the handler half; the
+    ``next_queued`` half is ``test_db_create_job.py``. Neither is enough alone.
+
+    Nonsense means the default, as with every other route in this app: an
+    operator who mistypes a setting should get the machine that is up, not a
+    refusal they did not ask for.
+    """
+    if route is None:
+        monkeypatch.delenv("MSE_GPU_ROUTE", raising=False)
+    else:
+        monkeypatch.setenv("MSE_GPU_ROUTE", route)
+    resp, db, _store, flashes = _post(tmp_path)
+    assert resp.status_code == 302 and len(db.jobs) == 1, flashes
+    (job,) = db.jobs.values()
+    assert job["kind"] == DB.TD
+    assert job["target"] == expected
 
 
 def test_a_coated_part_reaches_the_worker_as_a_shell(tmp_path):

@@ -1078,3 +1078,109 @@ def test_the_frames_come_back_on_the_host_whatever_xp_built_them():
     host = fdtd.simulate(**problem)["frames"]
     assert type(device) is np.ndarray and device.dtype == np.float32
     assert host.any() and np.array_equal(device, host)
+
+
+# ------------------------------------------------------- state handover
+
+def _state_arrays(state):
+    """The six component arrays of one (E, H) set, in a fixed order."""
+    return [np.asarray(state[which][c])
+            for which in (0, 1) for c in fdtd.COMPONENTS]
+
+
+def _driven_state(eps, n_steps=20):
+    return fdtd.simulate(eps, pulse(cell=(4, 4, 4)), n_steps,
+                         final_state=True)["final_state"]
+
+
+def test_a_zero_step_run_returns_the_state_it_was_given():
+    eps = np.ones((8, 8, 8), np.float32)
+    state = _driven_state(eps)
+    again = fdtd.simulate(eps, None, 0, initial_state=state, final_state=True)
+    assert again["injected"] is None
+    for before, after in zip(_state_arrays(state),
+                             _state_arrays(again["final_state"])):
+        assert np.array_equal(before, after)
+    assert again["traces"].shape[1] == 0
+
+
+def test_a_resumed_metal_run_equals_a_single_run_bitwise():
+    """On a metal boundary the six arrays are the whole state, so handing the
+    state over must change nothing: 20 + 20 equals 40, bit for bit."""
+    eps = np.ones((8, 8, 8), np.float32)
+    start = _driven_state(eps)
+    whole = fdtd.simulate(eps, None, 40, initial_state=start,
+                          final_state=True)["final_state"]
+    half = fdtd.simulate(eps, None, 20, initial_state=start,
+                         final_state=True)["final_state"]
+    pieces = fdtd.simulate(eps, None, 20, initial_state=half,
+                           final_state=True)["final_state"]
+    assert any(values.any() for values in _state_arrays(pieces))
+    for split, whole_array in zip(_state_arrays(pieces), _state_arrays(whole)):
+        assert np.array_equal(split, whole_array)
+
+
+def test_the_closure_hook_is_called_once_per_step_after_the_step():
+    eps = np.ones((7, 7, 7), np.float32)
+    seen = []
+
+    def closure(state, dt):
+        seen.append(dt)
+
+    run = fdtd.simulate(eps, pulse(cell=(3, 3, 3)), 7, closure=closure)
+    assert len(seen) == 7
+    assert all(dt == pytest.approx(run["dt"], rel=0) for dt in seen)
+
+
+def test_a_closure_may_return_a_replacement_state():
+    """The SP-Closure seam: a returned pair is copied in and the run steps on
+    from it. Zeroing the field every step leaves zeros everywhere."""
+    eps = np.ones((7, 7, 7), np.float32)
+
+    def closure(state, dt):
+        return tuple({c: np.zeros_like(np.asarray(part[c]))
+                      for c in fdtd.COMPONENTS} for part in state)
+
+    run = fdtd.simulate(eps, pulse(cell=(3, 3, 3)), 3, closure=closure,
+                        final_state=True)
+    for values in _state_arrays(run["final_state"]):
+        assert not values.any()
+
+
+def test_the_injected_charge_is_the_waveform_summed():
+    eps = np.ones((8, 8, 8), np.float32)
+    run = fdtd.simulate(eps, pulse(cell=(4, 4, 4)), 30, record_drive=True)
+    drive = np.asarray(run["drive"], np.float64)
+    assert drive.shape == (30,)
+    assert run["injected"] == pytest.approx(float(np.sum(drive * run["dt"])),
+                                            rel=1e-12, abs=1e-30)
+    plain = fdtd.simulate(eps, None, 3)
+    assert plain["injected"] is None
+
+
+def test_a_supplied_state_is_refused_by_name():
+    eps = np.ones((8, 8, 8), np.float32)
+    state = _driven_state(eps)
+    with pytest.raises(fdtd.FDTDError, match="shape"):
+        fdtd.simulate(np.ones((7, 7, 7), np.float32), None, 2,
+                      initial_state=state)
+    with pytest.raises(fdtd.FDTDError, match="periodic axis"):
+        fdtd.simulate(eps, None, 2, boundary=("periodic", "metal", "metal"),
+                      initial_state=state)
+    with pytest.raises(fdtd.FDTDError, match="polarisation term"):
+        fdtd.simulate(eps, None, 2, initial_state=state,
+                      ade_terms=[fdtd.LorentzDrude("Au", np.zeros((8, 8, 8),
+                                                                 bool))])
+    wave_eps = np.ones((PW_N,) * 3, dtype=np.float32)
+    with pytest.raises(fdtd.FDTDError, match="plane wave"):
+        fdtd.simulate(wave_eps, plane(), 2, spacings=PW_SPACINGS,
+                      boundary="open", pml_cells=PW_PML,
+                      initial_state=_driven_state(wave_eps))
+
+
+def test_a_bad_state_pair_is_refused_before_anything_is_written():
+    eps = np.ones((7, 7, 7), np.float32)
+    for state in ({}, ({c: np.zeros((7, 7, 7)) for c in fdtd.COMPONENTS},),
+                  "nonsense"):
+        with pytest.raises(fdtd.FDTDError, match="\\(E, H\\) pair"):
+            fdtd.simulate(eps, None, 1, initial_state=state)

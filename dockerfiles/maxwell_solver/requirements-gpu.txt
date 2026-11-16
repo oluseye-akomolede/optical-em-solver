@@ -13,6 +13,44 @@
 # Same pin the paper1 bench image measured.
 cupy-cuda12x==14.2.0
 
+# --- CUDA headers and libnvrtc, for the JIT that cupy actually does ---------
+#
+# Measured on a live td proof job (69e3152c, 2026-11-12), the FIRST failure on
+# this image that importing could not see:
+#
+#   RuntimeError: Failed to find CUDA headers ... at fdtd.py simulate ->
+#   `xp.all(eps > 0)`, the first elementwise kernel cupy JIT-compiles via NVRTC.
+#
+# The base is 12.6.3-RUNTIME: it carries the math libraries, not the toolkit.
+# So cupy imports, cuDSS loads, the build probe prints both OK lines -- and the
+# image cannot compile a single kernel. These three wheels are what NVRTC needs
+# and nothing more:
+#
+#   nvidia-cuda-runtime-cu12  cuda.h / cuda_runtime.h  (0.9 MB)
+#   nvidia-cuda-nvcc-cu12     crt/host_defines.h       (~40 MB)
+#   nvidia-cuda-nvrtc-cu12    libnvrtc.so.12 itself    (23.6 MB)
+#
+# The runtime wheel alone is not enough and neither is nvrtc alone: the compile
+# needs the headers AND the library. The headers are found through -I on the
+# wheel include dirs. The LIBRARY is not found by cuda-pathfinder at all --
+# measured on the dev VM, with the headers present and correct, cupy still
+# failed with `Failure finding "libnvrtc.so.13 or libnvrtc.so.12"`, because
+# pathfinder does not search site-packages/nvidia/*/lib. The probe therefore
+# preloads libnvrtc.so.12 by absolute path with ctypes (RTLD_GLOBAL) rather
+# than setting LD_LIBRARY_PATH, which an in-process assignment cannot change.
+# All three are worth
+# ~65 MB against the GBs `cupy-cuda12x[ctk]` would pull in -- and, unlike [ctk]
+# (which pins cuda-toolkit==12.* and so floats onto 12.9), these are pinned to
+# the SAME 12.6 line as nvidia/cuda:12.6.3-runtime, so the headers cannot drift
+# above the driver the A4000 is running. That drift is the same trap recorded
+# for cuda-bindings below.
+#
+# The build-time probe (gpu_stack_probe.nvrtc_probe) compiles a kernel with no
+# GPU and fails the BUILD if any of the three is missing or unusable.
+nvidia-cuda-runtime-cu12==12.6.77
+nvidia-cuda-nvcc-cu12==12.6.85
+nvidia-cuda-nvrtc-cu12==12.6.85
+
 # nvmath-python: the DirectSolver the GPU factorisation calls. 0.9.0 is what
 # the Jetson worker's venv runs (read there by the lead, 2026-11-03); it is
 # also the version whose tear-down (solver.free()) _CudssFactor.close() is
@@ -61,3 +99,22 @@ cuda-bindings==12.9.9
 # numpy/scipy come from requirements.txt, pinned there; cupy-cuda12x requires a
 # compatible numpy and pip resolves against the already-installed one, so they
 # are not restated here.
+
+# zarr: the HLST dataset's chunked on-disk format. Chosen because a dataset
+# row is written one TIME-CHUNK at a time (chunk 0, then 1, ...) while the run
+# is still going, so a killed Job keeps every completed chunk, and because two
+# writers can append different chunks of one array without a shared index file
+# -- which is what makes a ReadWriteMany dataset directory safe for several
+# Jobs at once (the mse-hlst-data PVC). Measured, not assumed: a round trip in
+# a scratch venv appended two chunks to one array and read them back, and the
+# directory held ONE file per chunk (0.0.0.0, 1.0.0.0, ...), not a rewritten
+# index.
+#
+# 2.18.3 with numcodecs 0.17.1 (the current release) FAILS ON IMPORT:
+#   ImportError: cannot import name 'cbuffer_sizes' from 'numcodecs.blosc'
+#   ... Did you mean: '_cbuffer_sizes'?
+# 0.12.1 is the newest numcodecs zarr 2.18.3 imports against, and both were
+# tested together in a scratch venv. Pin BOTH: zarr alone lets pip take
+# 0.17.x and the image then fails at the first dataset write, hours into a run.
+zarr==2.18.3
+numcodecs==0.12.1

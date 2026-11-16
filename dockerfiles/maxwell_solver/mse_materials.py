@@ -79,6 +79,39 @@ def _missing(param: str, why: str = "") -> Constant:
     )
 
 
+def _refused(param: str, why: str) -> Constant:
+    """A parameter that is absent on PURPOSE, because it does not exist.
+
+    Different from ``_missing``: a gap is "nobody has read this yet" and is the
+    job of a later retrieval pass; a refusal is a decision that the parameter is
+    undefined for this material (a metal has no static permittivity; a lifetime
+    is a property of the sample, not the material). Both carry NaN and both are
+    refused by ``require_cited``, so neither can reach a solve; keeping the pair
+    apart stops a refusal being reopened as a retrieval task that can never
+    succeed, and refuses "no, and stop asking" the same clear way.
+
+    DEVSIM's drift-diffusion contact models hard-code equilibrium carrier
+    densities and expose no surface recombination velocity, so an empirical
+    lifetime is also not load-bearing on the current path.
+    """
+    return Constant(
+        name=param,
+        value=float("nan"),
+        unit=_UNIT_OF.get(param, ""),
+        basis=(
+            "DELIBERATELY REFUSED, not a retrieval gap. " + why
+            + " This is a decision recorded in the library, not a missing value."
+        ),
+        verified=False,
+        assumed=True,
+        note="refused by require_cited and by design; see _refused in this module",
+    )
+
+
+#: Set once _LIBRARY exists, read back off the entries rather than hand-listed.
+REFUSED: dict[str, tuple[str, ...]] = {}
+
+
 #: Units, so an absent parameter is still described correctly.
 _UNIT_OF = {
     "eps_s": "1", "n_i_300K": "cm^-3",
@@ -153,6 +186,23 @@ def _eps_s(name: str, row: str, value: float, key: str) -> Constant:
 # here to find out.
 _IOFFE = "https://www.ioffe.ru/SVA/NSM/Semicond"
 
+# NASA/GRC Comparison of Selected Important Semiconductor Electronic Properties
+# of Major SiC Polytypes with Silicon, GaAs, and 2H-GaN. Table 5.1, explicitly
+# "at 300 K", columns: Silicon | GaAs | 4H-SiC | 6H-SiC | 3C-SiC | 2H-GaN.
+NASA_SIC_TABLE = (
+    "NASA/GRC (nasa.gov) 'Comparison of Selected Important Semiconductor "
+    "Electronic Properties of Major SiC Polytypes', Table 5.1 at 300 K"
+)
+
+#: TU Wien (Kaufmann) dissertation Table 2.3, SiC material parameters.
+#: Used for 4H n_i, where the NASA table's cell is physically impossible at
+#: 300 K -- see the derivation in the SiC n_i note. Its 6H n_i (1.6e-6) and
+#: its hole mobility (115, agreeing with NASA) are consistent with the calc,
+#: which is why the table is trusted for the one cell NASA gets wrong.
+TU_WIEN_SIC_TABLE = (
+    "TU Wien PhD thesis (Kaufmann), SiC material parameters, Table 2.3"
+)
+
 
 def _ioffe(mat: str, page: str, row: str, value: float, unit: str,
            name: str, note: str = "") -> Constant:
@@ -171,6 +221,24 @@ def _ioffe(mat: str, page: str, row: str, value: float, unit: str,
     )
 
 
+def _cited(page: str, row: str, value: float, unit: str, name: str,
+           *, note: str = "") -> Constant:
+    """A parameter read from a named, retrievable page other than Ioffe/NSM.
+
+    ``page`` must say what the document is and where it came from, ``row`` the
+    exact table row it was read off, so a value moved away from its source
+    shows up in a diff.
+    """
+    return Constant(
+        name=name,
+        value=value,
+        unit=unit,
+        basis=f"{page}, row '{row}'. Retrieved 2026-11-11 with curl.",
+        verified=True,
+        note=note,
+    )
+
+
 # --------------------------------------------------------------- library
 
 def _semiconductor(mat: str, eps_s: Constant, *,
@@ -180,19 +248,29 @@ def _semiconductor(mat: str, eps_s: Constant, *,
                    tau_e: Constant | None = None,
                    tau_h: Constant | None = None,
                    B_rad: Constant | None = None,
-                   gaps: dict[str, str] | None = None) -> Material:
+                   gaps: dict[str, str] | None = None,
+                   refused: tuple[str, ...] | None = None) -> Material:
     """A semiconductor entry; anything not supplied is an explicit gap.
 
     ``gaps`` says WHY a parameter is missing, per parameter, so an unretrieved
-    value carries the reason it is unretrieved.
+    value carries the reason it is unretrieved. ``refused`` names the parameters
+    in ``gaps`` that are absent BY DECISION rather than pending retrieval, so the
+    reason is recorded as a refusal and not reopened as a task that can never
+    succeed (see ``_refused``).
     """
     gaps = gaps or {}
+    refused = tuple(refused) if refused is not None else ()
     have = {"eps_s": eps_s, "n_i_300K": n_i, "mu_e": mu_e, "mu_h": mu_h,
             "tau_e": tau_e, "tau_h": tau_h, "B_rad": B_rad}
     params = {}
     for key in SEMICONDUCTOR_PARAMS:
         c = have.get(key)
-        params[key] = c if c is not None else _missing(key, gaps.get(key, ""))
+        if c is not None:
+            params[key] = c
+        elif key in refused:
+            params[key] = _refused(key, gaps.get(key, ""))
+        else:
+            params[key] = _missing(key, gaps.get(key, ""))
     return Material(name=mat, kind="semiconductor", params=params)
 
 
@@ -232,12 +310,26 @@ _LIBRARY: dict[str, Material] = {
                      note="Table footnote gives the source as Gerlach et al. "
                           "(1972)."),
         gaps={
+            # Second-source pass 2026-11-11 (TU Wien, Ayalew, node72): still
+            # refused, now on evidence rather than absence. The thesis gives
+            # the Scharfetter relation tau(N, T) but says "There are no
+            # reliable experimental data available to extract the corresponding
+            # parameters for a-SiC" and proposes borrowing Si values for SiC --
+            # the borrow is in the other direction, so it supplies no Si number.
+            # A second source searching for a Si lifetime number and finding
+            # none is a stronger refusal than "Ioffe drew it as a figure".
             "tau_e": "Ioffe gives Si lifetimes only as a figure (tau_n vs "
                      "acceptor density, 300 K) with no tabulated value, so no "
                      "number could be read off a table.",
             "tau_h": "Same: tau_p and L_p are a figure vs donor density, no "
                      "tabulated value.",
         },
+        # By decision, not pending retrieval: a lifetime is a property of the
+        # sample (doping, defects, process), not of "Si". The established
+        # doping-dependent models (Scharfetter) need per-part parameters that a
+        # material library cannot supply, so the user supplies tau per part via
+        # an override -- which resolve() records as its source.
+        refused=("tau_e", "tau_h"),
     ),
     # --- GaAs
     "GaAs": _semiconductor(
@@ -331,17 +423,81 @@ _LIBRARY: dict[str, Material] = {
                      "1.5*10^-12 cm^3 s^-1", 1.5e-12, "cm^3/s", "SiC (4H) B_rad",
                      note="Ioffe labels this row 'estimate' (Goldberg et al. "
                           "2001); an estimate, not a measurement."),
+        # The mobilities below come from NASA/GRC's polytype comparison table,
+        # which is the reason the 4H column is used rather than Ioffe's 6H
+        # fallback: it states the temperature ("at 300 K") that the field name
+        # asserts. n_i does NOT come from there -- its NASA cell fails the
+        # 300 K arithmetic (see the note) and TU Wien supplies it instead.
+        n_i=_cited(
+            TU_WIEN_SIC_TABLE,
+            "Table 2.3, 4H-SiC column, n_i = 5e-9 cm^-3 (table states NO "
+            "temperature; see the note)",
+            5e-9, "cm^-3", "SiC (4H) n_i_300K",
+            note="CORRECTED 2026-11-11 from NASA's ~1e-7, which the review "
+                 "rejected. "
+                 "TEMPERATURE CAVEAT, from the lead's source check: TU Wien "
+                 "Table 2.3 states NO temperature. The table's Eg 3.26 eV is "
+                 "described there as coming from liquid-He photoluminescence "
+                 "(low temperature), while this field asserts 300 K. The 5e-9 "
+                 "is therefore recorded as the table's value, NOT as a verified "
+                 "300 K figure -- the source does not say 300 K and this note "
+                 "must not put those words in its mouth. "
+                 "WHY 1e-7 IS STILL REJECTED (300 K arithmetic, so it applies "
+                 "only once we assume both sources mean ~300 K): "
+                 "n_i = sqrt(Nc*Nv)*exp(-Eg/2kT), Eg=3.26 eV (the library's 4H "
+                 "value), T=300 K. At m*==1.0 -- an impossible maximum -- this "
+                 "gives 1.04e-8 cm^-3, still 9.6x BELOW 1e-7. Over the "
+                 "plausible masses m_e*=0.2-0.37, m_h*=0.4-0.82 the range is "
+                 "1.56e-9 to 4.25e-9 (computed at the corners; the interior "
+                 "points lie within it). That brackets TU Wien's 5e-9 and is "
+                 "one to two orders below NASA's value. "
+                 "TWO DIFFERENT Eg DROPS, both correct, not interchangeable: "
+                 "(a) to reach 1e-7 from the table's 5e-9 at fixed masses needs "
+                 "Eg lower by 2kT*ln(20) = 0.155 eV, i.e. Eg = 3.105 eV; "
+                 "(b) to reach 1e-7 from the computed ceiling 1.04e-8 needs "
+                 "0.117 eV, i.e. Eg = 3.143 eV. "
+                 "WHY THAT IS DAMNING FOR NASA (a weaker claim than an earlier "
+                 "draft made): 3.10-3.14 eV is not 6H's gap either. 6H is "
+                 "~3.02 eV, so that band sits 0.12-0.16 eV BELOW 4H (3.26) and "
+                 "0.08-0.12 eV ABOVE 6H -- in neither polytype's gap. The "
+                 "anomaly is therefore plain MIS-SCALING, not 'NASA's cell is a "
+                 "6H number', which this note claimed before the arithmetic was "
+                 "redone. "
+                 "TU Wien's 6H value (1.6e-6) is high by ~3-5x against the same "
+                 "calc at Eg=3.02 (which gives 3.1e-7 to 6.4e-7) but the SAME "
+                 "ORDER -- consistent with a fitted table, which is why its 4H "
+                 "cell is trusted over NASA's on arithmetic alone."),
+        mu_e=_cited(
+            NASA_SIC_TABLE,
+            "Electron mobility at N_D=10^16 cm^-3, 4H-SiC: parallel-to-c "
+            "800, perpendicular-to-c 60",
+            800.0, "cm^2/(V s)", "SiC (4H) mu_e",
+            note="ANISOTROPIC source given as two numbers; the parallel-to-c "
+                 "axis value 800 is recorded because the tet-mesh solves have "
+                 "no c-axis convention to honour. Perpendicular is 60, a 13x "
+                 "difference, so a solve whose current flows across the c-axis "
+                 "is NOT covered by this entry."),
+        mu_h=_cited(
+            NASA_SIC_TABLE,
+            "Hole mobility at N_A=10^16 cm^-3, 4H-SiC column",
+            115.0, "cm^2/(V s)", "SiC (4H) mu_h",
+            note="NASA gives a single value for holes (no c-axis split), and "
+                 "it agrees with TU Wien Table 2.3, also 115."),
         gaps={
-            "n_i_300K": "Ioffe SiC/bandstr.html has n_i only as a figure vs "
-                        "temperature (Goldberg et al. 2001), no 300 K value in "
-                        "a table.",
-            "mu_e": "Ioffe SiC/electric.html and basic.html were fetched; "
-                    "neither carries a tabulated mobility.",
-            "mu_h": "Same: no tabulated hole mobility on the fetched pages.",
-            "tau_e": "Ioffe SiC/electric.html was fetched; no tabulated "
-                     "lifetime on it.",
-            "tau_h": "Same: no tabulated hole lifetime.",
+            "tau_e": "Neither source retrieved for SiC tabulates a carrier "
+                     "lifetime: NASA Table 5.1 has no lifetime row, TU Wien "
+                     "Table 2.3 omits it, and the TU Wien lifetime section "
+                     "(node72) explicitly says 'There are no reliable "
+                     "experimental data available to extract the "
+                     "corresponding parameters for a-SiC' -- it then proposes "
+                     "substituting Si lifetimes, which is an admission that no "
+                     "SiC number exists to read. Ioffe SiC pages carry none "
+                     "either. Remains a gap, not a plausible-looking number.",
+            "tau_h": "Same as tau_e: no SiC lifetime in NASA Table 5.1, TU "
+                     "Wien Table 2.3, TU Wien node72 or the fetched Ioffe SiC "
+                     "pages.",
         },
+        refused=("tau_e", "tau_h"),
     ),
     # --- insulators and metals: Ioffe/NSM carries semiconductors only.
     # The dielectrics path (SVA/NSM/Dielectrics/) returns 404 and the listed
@@ -360,23 +516,55 @@ _LIBRARY: dict[str, Material] = {
             "eps_s", "Ioffe/NSM covers semiconductors only; SVA/NSM/Dielectrics/ "
                      "returns 404. Needs a dielectric handbook.")},
     ),
+    # --- metals. A metal has NO static permittivity: in an electrostatic or
+    # drift-diffusion solve it is a conductor, i.e. a contact or equipotential,
+    # not a dielectric. (Optical, frequency-dependent metal permittivity is a
+    # separate library and out of scope.) The entries keep a kind of "metal" so
+    # a caller can find them, and eps_s stays an explicit gap with that reason.
     "Au": Material(
         name="Au", kind="metal",
-        params={"eps_s": _missing(
-            "eps_s", "Ioffe/NSM carries the semiconductors Si, Ge, SiC, AlN, "
-                     "GaAs, InP and their alloys only; no metals.")},
+        params={"eps_s": _refused(
+            "eps_s", "A metal has no static permittivity: in these solves gold "
+                     "is a conductor (contact or equipotential), not a "
+                     "dielectric. Ioffe/NSM carries semiconductors only, and no "
+                     "dielectric handbook would list a static eps for a metal. "
+                     "Using Au as a dielectric is refused; model it as a contact.")},
     ),
     "Ag": Material(
         name="Ag", kind="metal",
-        params={"eps_s": _missing(
-            "eps_s", "Ioffe/NSM carries the semiconductors Si, Ge, SiC, AlN, "
-                     "GaAs, InP and their alloys only; no metals.")},
+        params={"eps_s": _refused(
+            "eps_s", "A metal has no static permittivity: in these solves "
+                     "silver is a conductor (contact or equipotential), not a "
+                     "dielectric. Same reason as Au. Using Ag as a dielectric "
+                     "is refused; model it as a contact.")},
     ),
     "air": Material(
         name="air",
         kind="gas",
         params={"eps_s": _eps_s("air", "Air", 1.0, "air")},
     ),
+}
+
+#: The materials whose parameters are absent BY DECISION, not pending retrieval.
+#: Read back off the entries above rather than hand-listed: a hand-typed second
+#: copy is the thing that drifts from the library it describes. Each entry is a
+#: decision that must survive refactors -- a later pass that "closes the gap"
+#: here would have to invent a number, which is exactly what the library forbids.
+REFUSED.update({
+    mat.name: tuple(p for p, c in mat.params.items()
+                    if c.basis.startswith("DELIBERATELY REFUSED"))
+    for mat in _LIBRARY.values()
+})
+REFUSED = {k: v for k, v in REFUSED.items() if v}
+
+#: The parameters that are absent because nobody has read them yet. Unlike
+#: REFUSED, these are the CALLER's to supply: the quantity exists, and a
+#: per-part override is exactly how a value without a library source reaches the
+#: solve. Si's lifetimes used to sit here; they moved to REFUSED because the
+#: sample-dependence is a material fact, not a retrieval backlog.
+RETRIEVAL_GAPS: dict[str, tuple[str, ...]] = {
+    "Al2O3": ("eps_s",),
+    "HfO2": ("eps_s",),
 }
 
 LIBRARY_NAMES: tuple[str, ...] = tuple(_LIBRARY)
@@ -446,6 +634,22 @@ def resolve(
         for param, c in mat.params.items():
             vals[param] = c.value
             srcs[param] = f"library: {mat_name}"
+        # Every parameter still carrying a NaN here would go into the solve as
+        # NaN, far from the part that caused it; name it now instead. This ONE
+        # check covers both kinds of absence -- a retrieval gap nobody filled
+        # (Al2O3.eps_s) and a refusal the caller did not override (Au.eps_s) --
+        # because both are NaN by construction, and two checks for one rule is
+        # how they drift apart. The reason each is absent lives in its entry.
+        for param, c in mat.params.items():
+            if param in overrides.get(part, {}):
+                continue
+            if c.value != c.value:  # NaN is never equal to itself
+                kind = ("deliberately undefined for this material"
+                        if param in REFUSED.get(mat_name, ())
+                        else "a retrieval gap nobody has filled")
+                raise ValueError(
+                    f"{mat_name}.{param} is {kind} and part {part!r} does not "
+                    f"override it: {c.basis}")
         for param, value in overrides.get(part, {}).items():
             vals[param] = float(value)
             srcs[param] = "override"

@@ -134,6 +134,21 @@ DEFAULT_MAX_TETS = 600_000
 #: routing boundary, not a capability limit.
 DEFAULT_CPU_MAX_TETS = 150_000
 
+#: PEAK MEMORY a solver Job may use, in bytes. The Job is built with exactly
+#: this limit (``web/config.py`` imports it as ``JOB_MEMORY``), so a run that
+#: estimates above it is OOM-killed rather than slowed: refusing before the
+#: solve is the only way the user gets a message that names the size instead of
+#: watching a pod die.
+#:
+#: 14 GiB = 14 * 1024**3, NOT 14e9 and NOT the 16Gi admission ceiling in
+#: ``manifests/mse/power-cap.yaml``: the ceiling is what the namespace admits,
+#: the request is what this Job is given, and 16Gi would let a 15 GiB run be
+#: admitted and then killed. One number, read by the app (which builds the Job)
+#: and by the solver (which prices the run), because two constants that must
+#: agree and are never compared is the defect class ``DEFAULT_MAX_TETS``
+#: documents below.
+DEFAULT_JOB_MEMORY_BYTES = 14 * 1024 ** 3
+
 #: what a ``TooBigForProcessor`` writes into its termination message. The app
 #: reads this string back out of the pod's last state to tell "this job is on
 #: the wrong machine" from "this job is broken" -- see the class docstring in

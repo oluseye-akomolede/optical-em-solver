@@ -262,10 +262,37 @@ class FakeDb:
         if isinstance(targets, str):
             targets = (targets,)
         for job in self.jobs.values():
-            if (job["status"] == DB.QUEUED and job["target"] in targets
-                    and job["kind"] == DB.CAVITY):
+            if job["status"] != DB.QUEUED or job["target"] not in targets:
+                continue
+            # The pair, exactly as web/db.py states it: a cavity row on any Job
+            # target, a pc/td row on cluster-gpu only. This double used to
+            # admit CAVITY only and then say so in the docstring as though it
+            # mirrored the real clause -- so a pc row was invisible here for a
+            # reason production does not have, and the tests that go through
+            # this double would have passed by launching nothing.
+            if job["kind"] == DB.CAVITY:
+                return job
+            if job["kind"] in DB.GPU_KINDS and job["target"] == DB.CLUSTER_GPU:
                 return job
         return None
+
+    def jetson_waiting(self, older_than_seconds):
+        """Jetson rows nobody has claimed for longer than the wait window.
+
+        Modelled because the scheduler tick calls it on EVERY pass: a missing
+        method is an AttributeError, which the tick's middle ``except`` reads as
+        a broken statement and degrades the scheduler over an omission in a
+        test double -- the same trap ``reclaim_expired_leases`` below records.
+        """
+        out = []
+        for job in self.jobs.values():
+            if (job["status"] == DB.QUEUED and job.get("target") == DB.JETSON
+                    and job.get("lease_owner") is None
+                    and job.get("gpu_queued_at") is not None):
+                out.append({"job_id": job["job_id"],
+                            "est_tets": job.get("est_tets"),
+                            "kind": job["kind"]})
+        return out
 
     def queue_position(self, job_id):
         job = self.jobs.get(str(job_id))
@@ -2519,14 +2546,14 @@ def test_a_pc_form_queues_a_pc_job_with_its_request_stored(tmp_path,
     # est_tets is the node count the cap was checked against, recorded for the
     # same reason a cavity row records its element estimate.
     assert job["est_tets"] > 0
-    # A pc job runs on the JETSON, and this assertion used to say the opposite.
-    # It read "A pc job runs on the cluster: it has no GPU path" -- which was
-    # true of the *estimate* (a pc solve is small) and false of the *solver*:
-    # the only pc solver is the Jetson worker, which claims target='jetson'. The
-    # row was created target='cluster', the cluster launcher built a CAVITY Job
-    # for it, and the band diagram was never produced. The route now creates the
-    # row for the machine that can actually solve it.
-    assert job["target"] == DB.JETSON
+    # A pc job runs on a GPU, and WHICH one is the route. This assertion has
+    # now been wrong in both directions and the history is the point: it once
+    # read "target = cluster: pc has no GPU path" (wrong -- the cluster built a
+    # cavity Job), then "target = jetson: the only pc solver is the Jetson
+    # worker" (true until 2026-11-12, when the Jetson went offline and the GPU
+    # image gained the same pc_solve). The row now follows CFG.gpu_route() like
+    # every other GPU upload; the route-default test below pins both answers.
+    assert job["target"] == DB.CLUSTER_GPU
 
 
 def test_a_pc_form_with_a_file_is_refused_not_solved(tmp_path, monkeypatch):
@@ -3088,7 +3115,24 @@ def test_a_cluster_gpu_row_is_launched_as_a_gpu_job(tmp_path, monkeypatch):
         "on the CPU while the page said it was on the A4000"
     )
     pod = manifest["spec"]["template"]["spec"]
-    assert pod["nodeSelector"] == {"nvidia.com/gpu.product": "NVIDIA-RTX-A4000"}
+    # Both keys: the product stops the job landing on a different CARD (the
+    # manifest's memory price is the A4000's), and the node stops it landing on
+    # gpu-node-a, whose A4000s belong to the hcm team (owner, 2026-10-16).
+    # This assert was red from 072ed7a until it was fixed: the node pin landed
+    # in web/jobs.py without this line following it, so the test had been
+    # checking half of a decision the owner made.
+    #
+    # The node is read from web/jobs.py's own signature, not typed here, so a
+    # configurable node does not silently leave this assert pinning a stale
+    # literal -- the same reason test_web_app.py checks the key rather than the
+    # spelling.
+    import inspect
+    import jobs
+    default_node = inspect.signature(jobs.build_job_manifest).parameters["gpu_node"].default
+    assert pod["nodeSelector"] == {
+        "kubernetes.io/hostname": default_node,
+        "nvidia.com/gpu.product": "NVIDIA-RTX-A4000",
+    }
 
 
 def test_a_jetson_row_is_not_launched_by_the_cluster_launcher(

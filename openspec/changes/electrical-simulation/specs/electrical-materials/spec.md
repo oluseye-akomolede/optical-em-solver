@@ -22,6 +22,16 @@ A number quoted from memory SHALL NOT ship.
 - **WHEN** a part names a library material and also gives its own ε_s
 - **THEN** the solve uses the given ε_s, and the manifest records that part's ε_s as overridden
 
+#### Scenario: A solver reads the cited value, not the caller's number
+- **WHEN** a solver takes a material and the caller gives no ε_s
+- **THEN** the solve uses the library's cited ε_s, and the result reports the source as the library
+- **AND** a solver SHALL NOT accept a caller's number merely because a cited value exists;
+  the cited value is read through the gate and the caller's number is an explicit override
+
+#### Scenario: An override cannot fill a gap or override a refusal
+- **WHEN** a caller supplies a number for a parameter the library left empty or refused
+- **THEN** the solve is refused, naming the material and the parameter
+
 #### Scenario: An uncited library entry is refused by its own test
 - **WHEN** a library entry lacks a source for one of its parameters
 - **THEN** the materials test fails naming the material and the parameter

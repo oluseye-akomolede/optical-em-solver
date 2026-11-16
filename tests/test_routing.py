@@ -502,11 +502,26 @@ class RoutingDb(FakeDb):
                                       # schema's own defaults made explicit.
                                       kind=kind, pcs=pcs)
 
-    def reroute_to_cluster(self, job_id, reason):
+    def reroute_to_cluster(self, job_id, reason, gpu_route="jetson"):
+        """The real UPDATE's kind-and-route destination, modelled.
+
+        A cavity row lands on ``cluster``. A pc/td row lands on ``cluster-gpu``
+        when the route is ``cluster`` and is NOT moved when it is ``jetson``.
+        Modelled rather than left permissive because the difference IS the
+        regression: a double that moved every kind to ``cluster`` would make
+        ``test_an_unclaimed_td_job_...`` pass while production stranded the row.
+        """
         job = self.jobs.get(str(job_id))
         if not job or job.get("target") != DB.JETSON or job["status"] != DB.QUEUED:
             return False
-        job.update(target=DB.CLUSTER, message=reason, gpu_queued_at=None)
+        kind = job.get("kind")
+        if kind == DB.CAVITY:
+            destination = DB.CLUSTER
+        elif kind in DB.GPU_KINDS and gpu_route != "jetson":
+            destination = DB.CLUSTER_GPU
+        else:
+            return False
+        job.update(target=destination, message=reason, gpu_queued_at=None)
         self.reroutes.append((str(job_id), reason))
         return True
 
@@ -3102,8 +3117,14 @@ def _td_job(db, job_id="job-td"):
     return db.jobs[job_id]
 
 
-def test_an_unclaimed_td_job_stays_on_the_gpu_queue(tmp_path):
-    """Red on the pc-only guard: the td row is moved and logged as moved."""
+def test_an_unclaimed_td_job_stays_on_the_gpu_queue(tmp_path, monkeypatch):
+    """With the route on ``jetson`` the row is NOT moved — the worker may come.
+
+    This test replaces one that pinned the unconditional version ("a td row
+    never leaves the Jetson"). That is still true when the operator has chosen
+    the Jetson as the GPU machine, which is what the route says here.
+    """
+    monkeypatch.setenv("MSE_GPU_ROUTE", "jetson")
     db = RoutingDb()
     _td_job(db)
     logs: list[str] = []
@@ -3113,21 +3134,48 @@ def test_an_unclaimed_td_job_stays_on_the_gpu_queue(tmp_path):
     assert moved == 0
     assert db.jobs["job-td"]["target"] == DB.JETSON
     assert db.reroutes == []
-    assert any("'td' job" in line and "stays queued for the GPU" in line
+    assert any("'td' job" in line and "MSE_GPU_ROUTE is jetson" in line
                for line in logs), logs
 
 
-def test_the_abandon_pass_still_moves_a_cavity_row_beside_a_td_row(tmp_path):
-    """The whitelist must not freeze the cavity fallback it sits in."""
+def test_an_unclaimed_td_job_moves_to_the_a4000_route(tmp_path, monkeypatch):
+    """The rows already stuck on jetson: no worker is coming, so move them.
+
+    On the default route the Jetson is offline, so a td row nobody claimed is
+    waiting for a machine that is not there. It goes to ``cluster-gpu`` -- the
+    GPU image carries ``td_solve`` -- and NOT to ``cluster``, whose image has
+    no FDTD solver and would fail it after the queue wait.
+
+    Red before this change in the way that matters: the row stayed ``jetson``
+    forever and the owner's upload never ran.
+    """
+    monkeypatch.delenv("MSE_GPU_ROUTE", raising=False)
+    db = RoutingDb()
+    _td_job(db)
+    logs: list[str] = []
+
+    moved = APP._reroute_abandoned_gpu_jobs(db, FakeLauncher(), log=logs.append)
+
+    assert moved == 1
+    assert db.jobs["job-td"]["target"] == DB.CLUSTER_GPU, (
+        "a td row must go to the GPU route, never the CPU cluster")
+    assert any("cluster-gpu" in line for line in logs), logs
+
+
+def test_the_abandon_pass_still_moves_a_cavity_row_beside_a_td_row(tmp_path,
+                                                                  monkeypatch):
+    """The td ruling must not freeze the cavity fallback it sits in."""
+    monkeypatch.delenv("MSE_GPU_ROUTE", raising=False)
     db = RoutingDb()
     _td_job(db)
     _jetson_job(db, est_tets=20_000, job_id="job-cav")
 
     moved = APP._reroute_abandoned_gpu_jobs(db, FakeLauncher(), log=lambda _m: None)
 
-    assert moved == 1
-    assert db.jobs["job-cav"]["target"] == DB.CLUSTER
-    assert db.jobs["job-td"]["target"] == DB.JETSON
+    assert moved == 2
+    assert db.jobs["job-cav"]["target"] == DB.CLUSTER, (
+        "a cavity row still goes to the CPU cluster")
+    assert db.jobs["job-td"]["target"] == DB.CLUSTER_GPU
 
 
 def test_an_expired_td_lease_requeues_it_on_the_gpu(tmp_path):
@@ -3158,12 +3206,27 @@ def test_the_reaper_does_not_fail_a_running_td_job(tmp_path):
     assert db.jobs["job-td"]["target"] == DB.JETSON
 
 
-def test_the_real_store_refuses_a_td_job_off_the_jetson():
-    """Refused before any connection, so no later path has to rescue the row."""
+def test_the_real_store_refuses_a_td_job_off_the_gpu_routes():
+    """Refused on the CPU cluster. BOTH GPU targets are accepted.
+
+    The refusal used to name the Jetson as the only home a td job had. Since
+    the A4000 route exists it is a refusal of ``cluster`` specifically, so this
+    checks both sides: the CPU target raises before any connection, and the GPU
+    target does not raise for being a GPU.
+    """
     store = DB.JobStore({"host": "invalid.invalid", "dbname": "x"})
-    with pytest.raises(ValueError, match="Jetson only"):
+    with pytest.raises(ValueError, match="runs on a GPU"):
         store.create_job("job-td", "u.obj", "um", 1.0, 0, target=DB.CLUSTER,
                          kind=DB.TD, tds=dict(_TDS))
+
+    # ``cluster-gpu`` passes the target gate. There is no database here, so the
+    # call then fails on connecting -- which is what proves the gate let it
+    # through rather than the row having been created.
+    with pytest.raises(Exception) as exc:
+        store.create_job("job-td", "u.obj", "um", 1.0, 0, target=DB.CLUSTER_GPU,
+                         kind=DB.TD, tds=dict(_TDS))
+    assert not isinstance(exc.value, ValueError), (
+        f"cluster-gpu must be an accepted target for a td job, got {exc.value!r}")
 
 
 def _busy_td_job(db, job_id="td-1"):

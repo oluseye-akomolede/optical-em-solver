@@ -180,3 +180,30 @@ paths.
 #### Scenario: A map read from the wrong key fails the page test
 - **WHEN** the potential map is fed from the `field` key instead of `potential`
 - **THEN** the page test fails on the plotted values
+
+### Requirement: A run too large for its Job SHALL be refused before any solve
+Before allocating any solve array, the worker SHALL estimate the peak memory a drift-diffusion
+run needs from the mesh that run would build, and SHALL refuse with `ValueError` when the
+estimate exceeds the memory the solver Job is given. The refusal SHALL name the estimate, the
+limit, the node count, the edge count and what to change, and SHALL be raised before the
+matrix build. The limit SHALL be one named constant read by both the worker and the Job
+manifest, so the two cannot drift apart. The estimate SHALL be a documented, conservative
+factor model, not a constant fitted to one measurement.
+
+#### Scenario: A mesh too large for the Job is refused before the solve
+- **WHEN** a drift-diffusion run's estimated peak memory exceeds the Job's memory limit
+- **THEN** the run fails with a message naming the estimate, the limit, the node and edge
+  counts, and what to change, before a matrix is built
+
+#### Scenario: The same node count costs more in two dimensions
+- **WHEN** the estimate is taken for two meshes of equal node count but one with many rows
+- **THEN** the estimate is larger for the mesh whose grid is wider, because the estimate
+  comes from the mesh that run would build rather than from a constant
+
+#### Scenario: A round device is told to use the 1-D solve
+- **WHEN** an over-limit device is round within the project's roundness tolerance
+- **THEN** the refusal says the 1-D solve needs 2 orders of magnitude less memory
+
+#### Scenario: A run within the limit is allowed
+- **WHEN** the estimated peak memory is below the Job's memory limit
+- **THEN** the run proceeds to the solve unchanged

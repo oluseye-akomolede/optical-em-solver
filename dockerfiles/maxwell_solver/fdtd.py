@@ -2896,7 +2896,7 @@ def check_limits(estimate: dict, *, max_steps=None, max_seconds=None,
         raise EstimateError(exceeded)
 
 
-def simulate(eps_r, source: Source, n_steps: int, probes=(),
+def simulate(eps_r, source: Source | None, n_steps: int, probes=(),
              *, spacings=None, dx: float = 1.0,
              boundary: str = "metal", pec=None, pml_cells: int = DEFAULT_PML_CELLS,
              xp=None, record_energy: bool = False, energy_region=None,
@@ -2906,7 +2906,9 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
              phasor_box=None, phasor_frequencies=None, phasor_start: int = 0,
              phasor_window: str | None = "hann",
              ade_terms=(), check=None,
-             frames=None, bloch=None) -> dict:
+             frames=None, bloch=None, record_fields=None,
+             initial_state=None, final_state: bool = False,
+             closure=None) -> dict:
     """Run the grid and return the probe traces.
 
     ``eps_r`` ``(nx, ny, nz)`` is the relative permittivity of each node and it
@@ -2933,7 +2935,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
     Returns ``{"traces": (n_probes, n_steps) float32, "dt", "steps",
     "spacings", "energy", "peak", "drive", "source_field", "flux",
-    "source_volume", "source_eps", "phasor_faces"}``, and every
+    "source_volume", "source_eps", "injected", "final_state",
+    "phasor_faces"}``, and every
     one of them is HOST numpy whatever ``xp``
     was: the arrays live on the device for the whole run and cross back in a
     single transfer at the end, so a consumer never has to know which backend
@@ -2958,6 +2961,17 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     The three components are combined where they are stored, half a cell
     apart, without interpolation: it is a picture of the field, not a
     measurement. It is written into a device array (no sync a step).
+
+    ``record_fields`` adds ``"fields"``: ``{"steps": [...], "stride": (...)}``
+    keeps EVERY component -- ``"E"`` and ``"H"``, each a dict of the three
+    axes, one ``(n_steps_recorded, sx, sy, sz)`` float32 grid per step. It is
+    the training-set seam: :func:`frame_plan`'s ``frames`` store ``|E|``, which
+    throws away the direction a surrogate has to predict, so a dataset cannot
+    be built from them. The two families are kept in SEPARATE dicts because
+    ``COMPONENTS`` is the bare axis triple ("x", "y", "z") shared by both; one
+    dict keyed on it would let H overwrite E. The arrays live on ``xp`` for the
+    whole run and cross to the host once at the end, like every other result.
+    ``None`` when not asked for.
 
     ``bloch`` is a Bloch wave vector ``(kx, ky, kz)`` in rad/m on the periodic
     axes (``None`` is k = 0): the cell then models an infinite crystal whose
@@ -2996,6 +3010,35 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     moment readings take. It is ``eps_r[cell]`` in a dielectric and
     ``eps_inf`` (1) on a Lorentz-Drude metal's sample. ``None`` with no point
     source.
+
+    ``initial_state`` starts the run from one ``(E, H)`` pair of dicts keyed by
+    ``("x", "y", "z")``, in the same set format ``final_state`` returns; host
+    numpy or device arrays are accepted and copied into the run's own f32
+    arrays. A state is only portable to the problem it was produced on: this
+    run's ``eps_r`` shape, ``spacings``, ``boundary``, ``pml_cells`` and
+    ``ade_terms`` must be the ones that state was made with, and the engine
+    cannot check most of that, so the caller owns it. Refused by name on a
+    paired (Bloch) run, a periodic axis, a polarisation term, and a plane-wave
+    source. The magnetic-update memory of a CPML is NOT part of the state, so a
+    run resumed on an open boundary restarts it at zero; on a metal boundary
+    the fields are the whole state and a 20 + 20 split equals a 40-step run
+    bitwise.
+
+    ``final_state=True`` adds ``"final_state"``: the last step's ``(E, H)``
+    pair, copied to host numpy. ``source=None`` is a valid run with nothing
+    injected. ``closure``, if given, is called as ``closure(state, dt)`` once
+    per step, on the finished state, after the boundary handling and before the
+    probes; it may mutate the pair in place or return a replacement, which is
+    copied in like ``initial_state``. It is the one learning seam in the engine
+    and nothing in the solver passes it.
+
+    ``"injected"`` is ``sum(dt * value)`` the point source added over the whole
+    run, the scalar a pipeline carries across a state handover: the charge a
+    point source leaves on the grid is that value split over the two nodes its
+    sample sits between (:func:`repair.source_charge`). ``None`` with no point
+    source. Every shipped source profile is zero-mean, so after a completed
+    pulse it is ~1e-11 of the peak step; during the drive it is not, and it is
+    what the divider's charge target must be.
 
     ``flux_box`` adds ``"flux"``: ``(centre, half_extent)`` in cells (three
     integers each) makes a closed box of NODE layers, and the result is one
@@ -3063,8 +3106,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
     sides = _axis_boundaries(boundary)
     periodic = tuple(side == "periodic" for side in sides)
-    if int(n_steps) < 1:
-        raise FDTDError(f"n_steps must be at least 1, got {n_steps!r}")
+    if int(n_steps) < 0:
+        raise FDTDError(f"n_steps must be zero or more, got {n_steps!r}")
     n_steps = int(n_steps)
 
     if spacings is None:
@@ -3111,7 +3154,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     # The guard here sees only the dielectric index; the queue-time check,
     # which knows the metals' |n| at the run's frequencies, is the one that
     # stops a job before it is queued.
-    if source.profile == "drawn":
+    if source is not None and source.profile == "drawn":
         f_res = resolvable_frequency(primal, math.sqrt(float(eps.max())))
         above = drawn_energy_above(source.samples, source.duration, dt, f_res)
         if above > DRAWN_ENERGY_LIMIT:
@@ -3153,7 +3196,11 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                     f"where a {component}-polarised source is on the wall and "
                     f"the update never touches it; move it inward")
 
-    if source.kind == "plane":
+    if source is None:
+        # A state-only run: no injection and no source validation. This is how
+        # the repair asks the solver to advance a decoded state k steps.
+        pass
+    elif source.kind == "plane":
         travel = source.axis
         transverse = [sides[axis] for axis in range(3) if axis != travel]
         if "metal" in sides:
@@ -3176,7 +3223,8 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                 f"not supported")
     else:
         live(source.component, source.cell)
-    if source.kind == "point" and mask is not None and bool(mask[source.cell]):
+    if (source is not None and source.kind == "point"
+            and mask is not None and bool(mask[source.cell])):
         raise FDTDError(
             f"the source cell {source.cell} is inside the conductor; a soft "
             f"current there is zeroed by the PEC update on the same step and "
@@ -3192,7 +3240,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
 
     faces = _bloch_faces(bloch, sides, primal)
     paired = any(s != 0.0 for _c, s in faces.values())
-    if paired and source.kind == "plane":
+    if paired and source is not None and source.kind == "plane":
         raise FDTDError(
             "a plane wave cannot run with a Bloch phase away from k = 0 and "
             "the zone edge; a Bloch cell is driven by a point source")
@@ -3213,6 +3261,18 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     # exists only on the paired path, where the Bloch faces feed it from the
     # cos set (see _bloch_faces).
     sets = [new_set()] + ([new_set()] if paired else [])
+    if initial_state is not None:
+        if paired or terms or any(periodic) or (
+                source is not None and source.kind == "plane"):
+            raise FDTDError(
+                "a supplied initial_state needs a run whose state is the six "
+                "field arrays and nothing else: not a paired (Bloch) run, a "
+                "periodic axis, a polarisation term, or a plane wave")
+        _load_state(sets[0], initial_state, shape, xp)
+    if paired and (final_state or closure is not None):
+        raise FDTDError(
+            "final_state and closure are for the physical (cos) field; a "
+            "paired Bloch run has two sets and no single state to hand over")
     field, h_field = sets[0]
     Ex, Ey, Ez = (field[c] for c in COMPONENTS)
     Hx, Hy, Hz = (h_field[c] for c in COMPONENTS)
@@ -3252,7 +3312,7 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                         f"so they must hold the same material")
 
     plane = None
-    if source.kind == "plane":
+    if source is not None and source.kind == "plane":
         plane = _PlaneWave(
             source, shape, primal, dual, np.asarray(_host_result(eps, xp)),
             None if mask is None else np.asarray(_host_result(mask, xp)),
@@ -3324,14 +3384,22 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     # is driven, so a paired run has nothing to record beyond the plane-wave
     # case below; both end as None rather than an array of zeros.
     drive: list[float] | None = (
-        [] if record_drive and not paired and source.kind == "point" else None)
+        [] if record_drive and not paired and source is not None
+        and source.kind == "point" else None)
+    # The total a point source added to its own E sample over the run: the one
+    # number a pipeline carries across a state handover, because the charge a
+    # source leaves behind is this value spread over the two nodes the sample
+    # sits between (see repair.source_charge).
+    injected = (0.0 if source is not None and source.kind == "point"
+                else None)
     # The field at the source's own cell and component, each step after the
     # injection -- the other half of :func:`delivered_power`. Recorded here,
     # where the source's cell is already in hand, so a caller cannot pair a
     # drive with a probe that happens to sit somewhere else.
     source_field = (xp.zeros(n_steps, dtype=f32)
                     if record_source_field and plane is None and not paired
-                    and source.kind == "point" else None)
+                    and source is not None and source.kind == "point"
+                    else None)
     if flux_box is not None and paired:
         raise FDTDError(
             "a flux box needs the physical field, and away from k = 0 and the "
@@ -3367,13 +3435,15 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
     # the grid the run actually used, so a consumer cannot pair a moment with
     # another run's cell.
     source_volume = (source_cell_volume(primal, source.cell, source.component)
-                     if source.kind == "point" else None)
+                     if source is not None and source.kind == "point"
+                     else None)
     # The permittivity the update applies at the source's own sample, from the
     # array and terms this run was given: the eps the power and moment
     # readings take, so a consumer need not pass the layout's node value.
     source_eps = (source_permittivity(eps_r, source.cell, source.component,
                                       ade_terms=terms, boundary=boundary)
-                  if source.kind == "point" else None)
+                  if source is not None and source.kind == "point"
+                  else None)
     peak = ({c: xp.zeros(shape, dtype=f32) for c in COMPONENTS}
             if record_peak else None)
     movie = frame_at = sampled = None
@@ -3391,6 +3461,35 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         sampled = tuple(slice(None, None, k) for k in stride)
         movie = xp.zeros((len(frame_at),) + frame_shape(shape, stride),
                          dtype=f32)
+    # ``record_fields`` keeps every component, not just |E|: a training set
+    # learns the vector field, and |E| throws away the direction the model has
+    # to predict. Same stride family as ``frames``, but six arrays per step
+    # instead of one derived magnitude.
+    fields_record = None
+    if record_fields is not None:
+        f_stride = tuple(int(k) for k in record_fields["stride"])
+        if len(f_stride) != 3 or min(f_stride) < 1:
+            raise FDTDError(f"a field-record stride is three whole numbers "
+                            f">= 1, got {record_fields['stride']!r}")
+        f_steps = [int(s) for s in record_fields["steps"]]
+        if len(set(f_steps)) != len(f_steps):
+            raise FDTDError(f"field-record steps are repeated: {f_steps!r}")
+        for s in f_steps:
+            if not 0 <= s < n_steps:
+                raise FDTDError(f"field-record step {s!r} is outside the "
+                                f"run's {n_steps} steps")
+        f_at = {s: index for index, s in enumerate(f_steps)}
+        f_sampled = tuple(slice(None, None, k) for k in f_stride)
+        frames_shape = (len(f_at),) + frame_shape(shape, f_stride)
+        fields_record = {
+            "at": f_at,
+            "sampled": f_sampled,
+            # ``E`` and ``H`` are kept apart because ``COMPONENTS`` is the bare
+            # axis triple ("x", "y", "z") shared by both families: one dict
+            # keyed on those would silently overwrite E with H.
+            "E": {c: xp.zeros(frames_shape, dtype=f32) for c in COMPONENTS},
+            "H": {c: xp.zeros(frames_shape, dtype=f32) for c in COMPONENTS},
+        }
     if energy_region is None:
         region = (slice(None),) * 3
     else:
@@ -3606,13 +3705,15 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                     field[name] += increment
 
         # ---- source ------------------------------------------------------
-        if plane is None:
+        if source is not None and plane is None:
             value = source.value(t)
             field[source.component][source.cell] += dt * value
             if drive is not None:
                 drive.append(value)
             if source_field is not None:
                 source_field[step] = field[source.component][source.cell]
+            if injected is not None:
+                injected += dt * value
 
         # ---- PEC ---------------------------------------------------------
         for f in sets:
@@ -3622,6 +3723,15 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
         # (with every correction, term, source and conductor applied to it),
         # one period back.
         _wrap(sets, 0, faces, shape)
+
+        # ---- closure -----------------------------------------------------
+        # The one learning seam: called once per step on the finished state,
+        # and free to mutate it in place or return a replacement pair. Nothing
+        # in the engine passes it; the HLST repair leaves it for SP-Closure.
+        if closure is not None:
+            replaced = closure(sets[0], dt)
+            if replaced is not None and replaced is not sets[0]:
+                _load_state(sets[0], replaced, shape, xp)
 
         # ---- probes and energy -------------------------------------------
         for index, (cell, component) in enumerate(probe_list):
@@ -3656,6 +3766,18 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
             flux_array[step] = _flux_step(field, flux_terms, xp)
         if phasor is not None:
             phasor.accumulate(step, field, h_field)
+        if fields_record is not None:
+            index = fields_record["at"].get(step)
+            if index is not None:
+                # All six, from the cos set -- the physical field on the
+                # paired path, and the only set on the real one. Stored with
+                # the same xp the run uses, so a cupy run pays no per-step
+                # host transfer; the whole record crosses once at the end.
+                sample = fields_record["sampled"]
+                for family, values in (("E", field), ("H", h_field)):
+                    for component in COMPONENTS:
+                        fields_record[family][component][index] = \
+                            values[component][sample]
 
     progress_seconds = time.perf_counter() - progress_start
     print(f"progress  step {n_steps:,} of {n_steps:,}, {progress_seconds:,.1f} s,"
@@ -3675,7 +3797,21 @@ def simulate(eps_r, source: Source, n_steps: int, probes=(),
                      else _host_result(flux_array, xp)),
             "source_volume": source_volume,
             "source_eps": source_eps,
+            "injected": injected,
+            "final_state": (None if not final_state
+                            else _state_host(sets[0])),
             "frames": None if movie is None else _host_result(movie, xp),
+            "fields": (None if fields_record is None else
+                       # The save schedule travels WITH the arrays. Without it
+                       # a consumer can only assume the records are steps
+                       # 0,1,2,... which is true only at stride 1 and start 0;
+                       # every strided or windowed record would then be paired
+                       # against the wrong times, silently and confidently.
+                       dict({"steps": [int(s) for s in f_steps],
+                             "stride": [int(k) for k in f_stride]},
+                            **{f: {c: _host_result(v, xp)
+                                   for c, v in fields_record[f].items()}
+                               for f in ("E", "H")})),
             "traces_sin": (_host_result(traces_sin, xp) if paired
                            else None),
             "phasor_faces": None if phasor is None else phasor.faces()}
@@ -3692,6 +3828,50 @@ def _host_result(value, xp):
     """
     to_host = getattr(xp, "asnumpy", None)
     return np.asarray(value if to_host is None else to_host(value))
+
+
+def _state_host(state):
+    """A copy of one ``(E, H)`` set on host numpy, for handing to a caller.
+
+    Copied, not viewed: the returned arrays outlive the run, and a caller that
+    perturbs or resumes from them must not be writing into an array the solver
+    may still be using.
+    """
+    return tuple({c: np.array(_host_result(state[which][c], np),
+                              dtype=np.float32)
+                  for c in COMPONENTS}
+                 for which in (0, 1))
+
+
+def _load_state(target, state, shape, xp):
+    """Copy a supplied ``(E, H)`` set into the arrays the run will step.
+
+    ``target`` is the engine's own set, so the copy lands in the arrays the
+    update stencils read; nothing is re-bound. Every array is checked for shape
+    before anything is written, so a bad state is refused with the arrays still
+    zero rather than half-loaded.
+    """
+    try:
+        pairs = len(state) == 2 and all(
+            set(part) == set(COMPONENTS) for part in state)
+    except TypeError:
+        pairs = False
+    if not pairs:
+        raise FDTDError(
+            "initial_state must be one (E, H) pair of dicts keyed by "
+            f"{COMPONENTS!r}, got {type(state).__name__}")
+    for which, part in enumerate(state):
+        for c in COMPONENTS:
+            values = part[c]
+            if tuple(np.shape(values)) != tuple(shape):
+                raise FDTDError(
+                    "initial_state %s[%r] has shape %s but this run is %s; a "
+                    "state is only portable to the grid it was produced on"
+                    % ("EH"[which], c, tuple(np.shape(values)),
+                       tuple(shape)))
+    for which, part in enumerate(state):
+        for c in COMPONENTS:
+            target[which][c][...] = xp.asarray(part[c], dtype=xp.float32)
 
 
 def _outer(axes):

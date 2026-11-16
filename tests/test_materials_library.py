@@ -79,13 +79,19 @@ def test_a_per_part_override_wins_and_is_recorded_as_an_override():
 
 
 def test_an_override_of_an_unretrieved_parameter_is_marked_override():
-    # A user who supplies their own n_i for Si should not be blocked by the
-    # library not having one; the manifest attributes it to them.
+    # A user who supplies their own tau for Si should not be blocked by the
+    # library not carrying one; the manifest attributes it to them.
+    #
+    # Si's tau_e/tau_h are REFUSED rather than merely unretrieved (a lifetime is
+    # the sample's property, not the material's), which is a stronger statement
+    # about the LIBRARY. It is still a parameter the CALLER may supply, so the
+    # override must reach the solve: refusing the override too would turn "we
+    # will not guess" into "you cannot model silicon".
     values, sources = MM.resolve(
-        ["sub"], {"sub": "Si"}, {"sub": {"n_i_300K": 1e10}}
+        ["sub"], {"sub": "Si"}, {"sub": {"tau_e": 1e-5, "tau_h": 4e-6}}
     )
-    assert values["sub"]["n_i_300K"] == 1e10
-    assert sources["sub"]["n_i_300K"] == "override"
+    assert values["sub"]["tau_e"] == 1e-5
+    assert sources["sub"]["tau_e"] == "override"
     assert sources["sub"]["eps_s"] == "library: Si"
 
 
@@ -135,14 +141,19 @@ def test_require_cited_refuses_an_unretrieved_entry_by_name():
 
 @pytest.mark.xfail(
     strict=True,
-    reason="recorded gap 2026-11-09: exactly 11 parameters have no source, so "
-           "this test fails naming them, by design. They are the Al2O3, HfO2, "
-           "Au and Ag static permittivities (Ioffe/NSM covers semiconductors "
-           "only) and Si tau_e/tau_h plus SiC n_i/mu_e/mu_h/tau_e/tau_h (both "
-           "appear on their Ioffe pages as figures or formulas, not table "
-           "rows). test_the_gap_is_what_the_xfail_claims_it_is pins their "
-           "identity. Remove this mark only when all 11 are filled from a "
-           "source and this test passes.",
+    reason="8 parameters have no number in the library, so this test fails "
+           "naming them, by design. They are NOT one kind of absence: "
+           "6 refused on 4 materials -- Au eps_s and Ag eps_s (the library "
+           "refuses to carry a static permittivity for a conductor) and Si "
+           "tau_e/tau_h and SiC tau_e/tau_h (a lifetime is the sample's "
+           "property, not the material's) -- plus 2 retrieval gaps on 2 "
+           "materials, Al2O3 eps_s and HfO2 eps_s, which wait on a dielectric "
+           "handbook (Ioffe/NSM covers semiconductors only). The distinction "
+           "matters: a refusal is closed by a decision and will never be "
+           "filled, a gap is waiting on retrieval and might be. "
+           "test_the_gap_is_what_the_xfail_claims_it_is pins the identity and "
+           "the kind of each. Remove this mark when all 8 have numbers, i.e. "
+           "when require_cited() passes -- not before.",
 )
 def test_every_shipped_parameter_is_cited():
     MM.require_cited()
@@ -165,7 +176,13 @@ def test_the_gap_is_what_the_xfail_claims_it_is():
     # dropped citation shows up as one that joined it.
     expected = {
         "Si": ["tau_e", "tau_h"],
-        "SiC": ["n_i_300K", "mu_e", "mu_h", "tau_e", "tau_h"],
+        # The SiC n_i/mu_e/mu_h left this list when NASA Table 5.1 supplied
+        # them. The lifetimes are here as REFUSALS, not as pending retrieval:
+        # TU Wien node72 states there are no reliable data to extract the SiC
+        # lifetimes and proposes borrowing Si's instead, so no source exists
+        # to keep looking for. The four eps_s entries are the only two that
+        # are still genuinely being looked for.
+        "SiC": ["tau_e", "tau_h"],
         "Al2O3": ["eps_s"],
         "HfO2": ["eps_s"],
         "Au": ["eps_s"],
@@ -177,6 +194,30 @@ def test_the_gap_is_what_the_xfail_claims_it_is():
         assert f"{name}." in named, f"{name} is missing from the refusal: {named}"
     for name in set(MM.LIBRARY_NAMES) - set(expected):
         assert f"{name}." not in named, f"{name} is wrongly refused: {named}"
+
+    # The xfail reason above makes a CLAIM about how many of these are refusals
+    # and how many are retrieval gaps. A reason string is prose and cannot
+    # fail, so the claim is checked against the library here instead: if
+    # someone moves a parameter between the two kinds, the reason goes stale
+    # and this test -- not a reader -- catches it.
+    refused = {
+        f"{mat}.{param}"
+        for mat, params in MM.REFUSED.items()
+        for param in params
+    }
+    still_looking = {
+        f"{mat}.{param}"
+        for mat, params in expected.items()
+        for param in params
+        if f"{mat}.{param}" not in refused
+    }
+    assert len(refused) == 6 and len({p.split(".")[0] for p in refused}) == 4, (
+        f"the xfail reason says '6 refused on 4 materials'; the library says "
+        f"{len(refused)} refused on {len({p.split('.')[0] for p in refused})} "
+        f"materials: {sorted(refused)}")
+    assert len(still_looking) == 2 and len({p.split(".")[0] for p in still_looking}) == 2, (
+        f"the xfail reason says '2 retrieval gaps on 2 materials'; the library "
+        f"says {len(still_looking)}: {sorted(still_looking)}")
 
 
 def test_the_retrieved_values_are_the_cited_ones():
@@ -263,6 +304,91 @@ def test_report_prints_every_parameter_with_its_status():
     # Counted from the library, not typed in: DERIVED, so it cannot drift from
     # the data without a failure.
     absent = sum(len(v) for v in MM.gaps().values())
-    assert absent == 11
+    # Was 11. Filling SiC n_i_300K, mu_e and mu_h from NASA Table 5.1 removes
+    # three; the two SiC lifetimes could not be filled from any source
+    # retrieved and remain gaps.
+    assert absent == 8
     assert text.count("[ASSUMED]") == absent
     assert text.count("[cited]") == 34 - absent
+
+
+# ------------------------------------------------- scenario 3, the refusals
+#
+# The second-source pass (2026-11-11) closed none of the remaining gaps and
+# found that four of them CANNOT be closed by retrieval: a metal has no static
+# permittivity, and a lifetime is a property of the sample, not the material.
+# They are recorded as decisions rather than as pending work, so the next pass
+# does not reopen them and invent a number to close them.
+
+def test_the_refusals_are_the_four_decided_ones():
+    """Pins WHICH gaps are deliberate, and that they are still gaps.
+
+    The asymmetry matters: the retrieval gaps (Al2O3, HfO2 eps_s) wait on a
+    handbook and may be closed honestly later. These four may not, so an entry
+    moving out of REFUSED without a new source is the bug this test catches.
+    """
+    assert {k: sorted(v) for k, v in MM.REFUSED.items()} == {
+        "Ag": ["eps_s"],
+        "Au": ["eps_s"],
+        "Si": ["tau_e", "tau_h"],
+        "SiC": ["tau_e", "tau_h"],
+    }
+    # A refusal is still refused: the number is NaN and unverified, so it can
+    # never reach a solve just because the reason changed.
+    for mat, params in MM.REFUSED.items():
+        for param in params:
+            c = MM.Material and MM._LIBRARY[mat].params[param]
+            assert not c.verified
+            assert c.value != c.value, f"{mat}.{param} carries a number"
+            assert c.basis.startswith("DELIBERATELY REFUSED"), c.basis
+    # ...and the ones waiting on a retrieval are NOT mislabelled as decisions.
+    for waiting in ("Al2O3", "HfO2"):
+        for c in MM._LIBRARY[waiting].params.values():
+            assert not c.basis.startswith("DELIBERATELY REFUSED"), (
+                f"{waiting} is a retrieval gap, not a refusal")
+
+
+def test_a_metal_cannot_be_used_as_a_dielectric():
+    """The refusal has to reach the solve path, not just the entry's prose.
+
+    Au and Ag are how a user would plausibly model an electrode's surroundings;
+    letting that through with NaN would put a NaN in the potential equation, or
+    worse, tempt a later edit to substitute a plausible number. It is refused by
+    name instead.
+    """
+    with pytest.raises(ValueError, match=r"Au\.eps_s"):
+        MM.resolve(["plate"], {"plate": "Au"})
+    with pytest.raises(ValueError, match=r"Ag\.eps_s"):
+        MM.resolve(["plate"], {"plate": "Ag"})
+    # A silicon part is refused for its lifetimes for the same reason: they are
+    # the sample's property and must come from the caller, not the library.
+    with pytest.raises(ValueError, match=r"Si\.tau_e"):
+        MM.resolve(["body"], {"body": "Si"})
+    # Refusing the LIBRARY value is not refusing the CALLER: a part that supplies
+    # its own lifetime resolves, because a lifetime is a sample property the
+    # caller knows and the library must not invent.
+    values, sources = MM.resolve(
+        ["body"], {"body": "Si"}, {"body": {"tau_e": 1e-5, "tau_h": 4e-6}}
+    )
+    assert sources["body"]["tau_e"] == "override"
+
+
+def test_a_per_part_lifetime_override_closes_the_refusal():
+    """The refusal names the fix: supply tau per part, and it is recorded as one.
+
+    This is the difference between "we refused" and "you cannot use silicon".
+    The override path already exists for overrides generally; what this pins is
+    that the REFUSED parameter is reachable through it -- a refusal that also
+    blocks the override would be a dead end, not a decision.
+    """
+    values, sources = MM.resolve(
+        ["body"], {"body": "Si"},
+        overrides={"body": {"tau_e": 1e-5, "tau_h": 4e-6}},
+    )
+    assert values["body"]["tau_e"] == 1e-5
+    assert values["body"]["tau_h"] == 4e-6
+    assert sources["body"]["tau_e"] == "override"
+    assert sources["body"]["tau_h"] == "override"
+    # ...and the override does not erase the refusal from the library: the next
+    # caller who forgets still gets an error naming the reason.
+    assert "tau_e" in MM.REFUSED["Si"]

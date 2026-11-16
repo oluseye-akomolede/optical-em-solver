@@ -30,7 +30,7 @@ spec:
         - name: mse-harbor-pull
       initContainers:
         - name: schema
-          image: registry.example/mode-search-engine/mse-web:4846b0b
+          image: registry.example/mode-search-engine/mse-web:28997f1
           command: ["python", "-c"]
           args:
             - |
@@ -48,7 +48,7 @@ spec:
                 name: mse-db
       containers:
         - name: web
-          image: registry.example/mode-search-engine/mse-web:4846b0b
+          image: registry.example/mode-search-engine/mse-web:28997f1
           # gunicorn, not the Flask dev server. EXACTLY ONE worker: the tick
           # thread that launches solver Jobs runs in-process, and two workers
           # would race for the namespace's single Job slot. --threads gives the
@@ -60,15 +60,23 @@ spec:
               containerPort: 5000
           env:
             - name: MSE_SOLVER_IMAGE
-              value: registry.example/mode-search-engine/mse-maxwell-solver:968fa24
+              value: registry.example/mode-search-engine/mse-maxwell-solver:1cca12b
             # The CUDA-stack image for cluster GPU solves. SEPARATE from
             # MSE_SOLVER_IMAGE on purpose: that one is python:3.12-slim with no
             # CUDA, so a GPU job launched on it dies at backend selection after
             # it has already taken the quota slot. Required whenever
-            # MSE_GPU_ROUTE is cluster (the default); the app refuses to start a
-            # GPU job without it rather than falling back.
+            # MSE_GPU_ROUTE is cluster (the default).
+            #
+            # The app's guard is WEAKER than "refuses to start a GPU job
+            # without it": config.py raises only when the value is EMPTY. A
+            # literal placeholder like MSE_SOLVER_GPU_IMAGE=PLACEHOLDER is a
+            # non-empty string, so the guard passes, the Job launches, takes
+            # the single GPU slot and only then dies at image pull. The value
+            # must therefore be a real, pullable tag; a commit-time test
+            # (tests/test_deploy_artifacts.py) enforces that, because the
+            # runtime check will not catch it.
             - name: MSE_SOLVER_GPU_IMAGE
-              value: registry.example/mode-search-engine/mse-maxwell-solver-gpu:PLACEHOLDER
+              value: registry.example/mode-search-engine/mse-maxwell-solver-gpu:28997f1
             - name: MSE_PULL_SECRET
               value: mse-harbor-pull
             - name: MSE_BUCKET

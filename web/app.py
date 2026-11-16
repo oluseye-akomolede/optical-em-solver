@@ -17,6 +17,8 @@ presigned.
 from __future__ import annotations
 
 import gzip
+import json
+import math
 import os
 import sys
 import threading
@@ -326,12 +328,29 @@ def create_app(config: dict | None = None) -> tuple[Flask, object, object, objec
         }
         if job["status"] == DB.DONE:
             if job["kind"] == DB.PC:
-                # A pc job's result is the band diagram the worker wrote back
-                # into pcs. The 3-D keys (modes/manifest/surface) are NOT sent:
-                # sending an empty mode list would read as "no modes" rather
-                # than "not a mode job" -- the deploy-3 shape, at the page.
+                # A pc job's result is the band diagram. WHERE it lives depends
+                # on the route that ran it, and this is the seam a live job
+                # fell through on 2026-11-12 (proof job 9ee91e75): the Jetson
+                # worker POSTs its bands back and worker_api stores them in
+                # pcs.bands, but a cluster Job writes only result.json and
+                # set_stage(done). The row was DONE with storage holding 30
+                # k-points x 4 bands and the page was sent bands=null.
+                #
+                # So: read the row first (the Jetson route's copy, already
+                # validated), and fall back to the cluster Job's result.json.
+                # Reading the file rather than having the solver merge into
+                # pcs is deliberate -- the solver has no write path to that
+                # column (its DB client sets stage/result only), and giving it
+                # one would couple the solver image to this schema found in a
+                # third place.
+                #
+                # The 3-D keys (modes/manifest/surface) are NOT sent: sending
+                # an empty mode list would read as "no modes" rather than "not
+                # a mode job" -- the deploy-3 shape, at the page.
                 pcs = job.get("pcs") or {}
                 payload["bands"] = pcs.get("bands")
+                if payload["bands"] is None:
+                    payload["bands"] = _cluster_pc_bands(store, job_id)
             elif job["kind"] == DB.TD:
                 # A td job wrote a trace, a spectrum manifest and movie frames,
                 # not modes: the cavity keys would point at files that do not
@@ -581,6 +600,55 @@ def _log_worker_failures(app) -> None:
         return response
 
 
+def _stage_worker_request(store, jobs_db, job_id) -> None:
+    """Write ``jobs/<id>/job.json`` -- the request a GPU worker loads.
+
+    The row is the source of truth; this is the copy the solver can read. The
+    shape is the same dict ``claim_jetson`` hands the Jetson worker, so both
+    routes present the SAME request to the same ``pc_solve``/``td_solve``. The
+    worker modules read ``job["pcs"]`` or ``job["tds"]`` and validate by key
+    themselves, so nothing is re-validated here.
+
+    ``kind`` decides which of the two request blobs is written. A pc row whose
+    ``pcs`` is NULL is a bug upstream (``create_job`` requires it for kind pc),
+    and it is refused rather than staged as ``null``: the worker would then
+    reject the row for a missing ``pcs`` key and the owner would read a
+    parameter error for a storage bug.
+    """
+    row = jobs_db.get_job(job_id)
+    if row is None:
+        raise LookupError(f"no row for job {job_id}")
+
+    kind = row.get("kind")
+    # The REQUEST COLUMNS are plural and are named after what they hold, not
+    # after the kind: a kind-'pc' row stores its request in ``pcs`` and a
+    # kind-'td' row in ``tds``. Using the kind constants here (``DB.PC`` ==
+    # "pc") looked right and was wrong for both kinds -- the row has no "pc"
+    # or "td" key, so every pc and td upload hit the ValueError below at
+    # launch time and the owner saw "the solve could not be prepared".
+    _REQUEST_COLUMN = {DB.PC: "pcs", DB.TD: "tds"}
+    field = _REQUEST_COLUMN.get(kind)
+    if field is None:
+        raise ValueError(f"job {job_id} is kind {kind!r}, which has no request")
+    request_json = row.get(field)
+    if request_json is None:
+        raise ValueError(f"job {job_id} is kind {kind!r} but has no {field!r}")
+
+    payload = {
+        "job_id": str(row["job_id"]),
+        "kind": kind,
+        "units": row.get("units"),
+        "n_index": row.get("n_index"),
+        "n_modes": row.get("n_modes"),
+        "min_feature_m": row.get("min_feature_m"),
+        "scale": row.get("scale"),
+        "materials": row.get("materials"),
+        field: request_json,
+    }
+    store.write(STORE.job_key(job_id, "job.json"),
+                json.dumps(payload, sort_keys=True).encode("utf-8"))
+
+
 def run_tick(store, jobs_db, launcher, log=print) -> dict:
     """One pass of the scheduler: reclaim dead Jobs, then launch at most one.
 
@@ -647,6 +715,34 @@ def run_tick(store, jobs_db, launcher, log=print) -> dict:
     job = jobs_db.next_queued()
     if not job:
         return result
+
+    # Stage the request for a GPU worker BEFORE the Job exists. A pc or td
+    # solve starts by loading its request from the object store
+    # (`jobs/<id>/job.json`); a cavity Job gets everything it needs from the
+    # manifest and the uploaded mesh. Without this file the worker starts,
+    # cannot find its request, and dies in about a minute -- live, 2026-11-12,
+    # every pc and td upload failed this way. The Jetson never needed it
+    # because its worker reads the row from the database directly; the cluster
+    # path assumed a staged file that nothing produced.
+    #
+    # Staged here rather than in an upload handler for one reason: this is the
+    # single point every cluster Job passes through, so a kind added later
+    # cannot forget it. (The upload handlers do call this function, so in the
+    # common case staging happens during the POST -- but that is because they
+    # tick, not because staging lives there. A row launched by the background
+    # ticker instead is staged the same way.) A failure to stage is a FAILED
+    # job, not a quiet one -- launching a solver whose request is missing is
+    # exactly the live failure this fixes.
+    if job.get("kind") in DB.GPU_KINDS:
+        try:
+            _stage_worker_request(store, jobs_db, job["job_id"])
+        except Exception as exc:  # noqa: BLE001 - a request we cannot stage
+            jobs_db.mark_failed(job["job_id"], (
+                "The solve could not be prepared: its request could not be "
+                "saved. Please try again in a minute."))
+            log(f"[mse-web] could not stage the request for job "
+                f"{job['job_id']}: {exc}")
+            return result
 
     try:
         name = launcher.create(job["job_id"], job["units"], job["n_index"],
@@ -769,27 +865,34 @@ def _reroute_abandoned_gpu_jobs(jobs_db, launcher, log=print) -> int:
                 f"the {limit:,} the cluster can solve; it stays queued for the GPU")
             continue
         kind = entry.get("kind")
-        if kind != DB.CAVITY:
-            # Only a cavity row can go to the cluster: the launcher builds one
-            # Job shape, the cavity solver, so a pc or td row moved there would
-            # be cavity-solved, and both queues would then be blind to it
-            # (next_queued takes cavity rows only; claim_jetson needs
-            # target='jetson'). It stays on the GPU queue, the same rule the
-            # size escape above applies. A WHITELIST, so a future kind is kept
-            # here by default rather than swept to the cluster. The message the
-            # owner sees is NOT the "moved to the cluster queue" one -- nothing
-            # moved. (reroute_to_cluster refuses these in its SQL too; this arm
-            # is what makes the decision visible in the log.)
-            log(f"[mse-web] job {job_id}: a {kind!r} job, and the cluster "
-                f"only runs cavity solves; it stays queued for the GPU")
+        if kind not in (DB.CAVITY, *DB.GPU_KINDS):
+            # A WHITELIST: a kind added later is kept here by default rather
+            # than swept to a machine nobody has said can run it. (The store's
+            # SQL refuses an unknown kind too; this arm says so in the log.)
+            log(f"[mse-web] job {job_id}: a {kind!r} job, and no cluster route "
+                f"is defined for that kind; it stays queued for the GPU")
             continue
+        if kind in DB.GPU_KINDS and CFG.gpu_route() == CFG.GPU_ROUTE_JETSON:
+            # The route says the Jetson is this rig's GPU machine, so its
+            # worker may still come. Moving a pc/td row to the A4000 would
+            # contradict the operator's own setting; it stays on the GPU queue
+            # exactly as it did before the cluster route existed.
+            log(f"[mse-web] job {job_id}: a {kind!r} job and MSE_GPU_ROUTE is "
+                f"jetson; it stays queued for the Jetson worker")
+            continue
+        # A cavity row goes to the CPU cluster; a pc/td row goes to
+        # cluster-gpu, where the GPU image carries their solvers. The store
+        # picks the destination from the row's kind and the route.
+        destination = "cluster" if kind == DB.CAVITY else "cluster-gpu"
         if jobs_db.reroute_to_cluster(
                 job_id,
                 "This object was queued for the graphics processor, which has "
-                "not picked it up, so it has been moved to the cluster queue."):
+                f"not picked it up, so it has been moved to the {destination} "
+                "queue.",
+                gpu_route=CFG.gpu_route()):
             moved += 1
             log(f"[mse-web] job {job_id}: no GPU worker claimed it in "
-                f"{CFG.gpu_wait_seconds():.0f}s; moved to the cluster queue")
+                f"{CFG.gpu_wait_seconds():.0f}s; moved to the {destination} queue")
     return moved
 
 
@@ -894,12 +997,19 @@ def _fail_dead_jobs(launcher, jobs_db, log=print) -> int:
         # job: the solver only ever raises this on the cpu backend, and a jetson
         # row that somehow carries the reason must not be sent to the cluster
         # it was routed away from a moment ago.
+        #
+        # ``gpu_route`` is passed because the store's kind guard sends a
+        # non-cavity row to ``cluster-gpu``, not ``cluster``. With the route on
+        # ``jetson`` the store declines to move such a row at all, so this
+        # falls through to the plain failure instead of queuing it on a machine
+        # the route says is not in use.
         if reason == JOBS._REROUTE_REASON and job.get("target") != DB.JETSON:
             if jobs_db.reroute_to_cluster(
                     job["job_id"],
                     "This object needs more elements than the cluster solver "
                     "can handle, so it has been queued for the graphics "
-                    "processor instead."):
+                    "processor instead.",
+                    gpu_route=CFG.gpu_route()):
                 log(f"[mse-web] job {job['job_id']} re-routed to the GPU queue: "
                     f"its Job {name or '<unnamed>'} reported the mesh is too "
                     f"large for the cluster")
@@ -1129,8 +1239,7 @@ def _handle_upload(app, store, jobs_db):
     # fleet, and now has two answers -- an A4000 Job or the Jetson worker -- so
     # it is a setting rather than the else-branch of one comparison.
     if est_tets >= CFG.gpu_min_tets():
-        target = DB.JETSON if CFG.gpu_route() == CFG.GPU_ROUTE_JETSON \
-            else DB.CLUSTER_GPU
+        target = _gpu_target()
     else:
         target = DB.CLUSTER
 
@@ -1159,6 +1268,24 @@ def _handle_upload(app, store, jobs_db):
     return redirect(url_for("job_page", job_id=job_id))
 
 
+def _gpu_target() -> str:
+    """Which GPU machine an upload that needs a GPU is queued for.
+
+    ``cluster-gpu`` (the A4000 Job) by default, ``jetson`` when the operator sets
+    ``MSE_GPU_ROUTE=jetson``. One function so the cavity, pc and td uploads
+    cannot disagree about the route -- they used to: cavity read this setting,
+    pc and td hardcoded the Jetson, so deploying the cluster route left every
+    band-diagram and time-domain upload queued for a machine that was offline.
+
+    Never ``cluster``: the CPU image has no pc, td or GPU solver, so a row
+    created there would take the single quota slot and fail. The caller decides
+    *whether* an upload needs a GPU; this only decides which one.
+    """
+    if CFG.gpu_route() == CFG.GPU_ROUTE_JETSON:
+        return DB.JETSON
+    return DB.CLUSTER_GPU
+
+
 def _handle_pc_upload(app, store, jobs_db):
     """Validate, cap-check and queue one photonic-crystal request.
 
@@ -1174,16 +1301,22 @@ def _handle_pc_upload(app, store, jobs_db):
     counts the cell through the solver's own mesher. This function's job is the
     part that needs the database: write the row and start it. It is a job like
     any other -- `kind='pc'` and the same claim/solve/store journey the cavity
-    jobs take -- with ONE difference that is a routing fact, not a preference:
-    it is created ``target=JETSON``.
+    jobs take -- and its target comes from :func:`config.gpu_route`, the same
+    setting the cavity path reads: ``cluster-gpu`` by default, ``jetson`` when
+    the operator sets ``MSE_GPU_ROUTE=jetson``.
 
-    The pc solver exists nowhere but the Jetson worker. There is no cluster pc
-    path in this change, so a pc row created ``target=cluster`` would be handed
-    by ``run_tick`` to ``launcher.create``, which builds a CAVITY Job, and the
-    band diagram would come back as a cavity solve of nothing. The route, the
-    queue and the launcher all agree on this: the row is created for the Jetson,
-    ``next_queued`` skips ``kind='pc'``, and ``launcher.create`` refuses one
-    outright rather than trusting the filter upstream.
+    The route is a setting because both machines can run this solve. The Jetson
+    worker and the A4000 GPU image carry the SAME ``pc_solve``/``pc.py`` -- the
+    image copies the worker module rather than re-implementing it -- so the
+    question is only which GPU. Before the Jetson went offline (2026-11-12)
+    this row was hardcoded ``target=JETSON`` and a cluster pc route did not
+    exist; the rollback is now one environment change rather than a revert.
+
+    A pc row must never be created on the CPU ``cluster`` target: that image
+    has no pc solver, so ``launcher.create`` would build a cavity Job. Three
+    things agree on this -- ``create_job`` refuses it, ``next_queued`` admits a
+    pc row only on ``cluster-gpu``, and ``launcher.create`` refuses a non-cavity
+    kind without ``gpu=True``.
     """
     uploaded = request.files.get("meshfile")
     if uploaded is not None and uploaded.filename:
@@ -1211,7 +1344,7 @@ def _handle_pc_upload(app, store, jobs_db):
              f"{planned['n_bands']} bands, {planned['polarisation']}")
 
     jobs_db.create_job(job_id, label, CFG.DEFAULT_UNITS, 1.0,
-                       planned["divisions"], target=DB.JETSON,
+                       planned["divisions"], target=_gpu_target(),
                        est_tets=planned["nodes"], kind=DB.PC,
                        pcs=request_json)
 
@@ -1228,9 +1361,18 @@ def _handle_td_upload(app, store, jobs_db):
 
     The upload goes through the same size and readability rails as a cavity
     upload; everything else is :mod:`td_form`, which refuses by name, with the
-    solver's own layout and limits, before the row exists. A td row is created
-    ``target=JETSON`` because the FDTD solver exists nowhere else
-    (``create_job`` refuses any other target).
+    solver's own layout and limits, before the row exists.
+
+    The target comes from :func:`_gpu_target`, like the pc row: the Jetson
+    worker and the GPU image carry the same ``td_solve``/``fdtd.py``, so either
+    machine can run it, and ``MSE_GPU_ROUTE=jetson`` is the rollback. The CPU
+    ``cluster`` target would be refused by ``create_job`` -- its image has no
+    FDTD solver.
+
+    What the page reads from a td job does NOT change with the route:
+    ``spectrum.json`` and ``trace.bin``, which ``solve_td`` writes to the store
+    itself. The A4000 path writes them through the same ``solve_td`` call, so
+    the page has no route branch to get wrong.
     """
     uploaded = request.files.get("meshfile")
     if uploaded is None or not uploaded.filename:
@@ -1273,7 +1415,7 @@ def _handle_td_upload(app, store, jobs_db):
         flash(str(exc))
         return redirect(url_for("index"))
     jobs_db.create_job(job_id, TDF.label(planned, uploaded.filename), units,
-                       planned["n_index"], 0, target=DB.JETSON,
+                       planned["n_index"], 0, target=_gpu_target(),
                        est_tets=planned["estimate"]["cells"], scale=scale,
                        materials=planned["materials"], kind=DB.TD,
                        tds=planned["tds"])
@@ -1565,6 +1707,66 @@ def _bytes_io(data: bytes):
     import io
 
     return io.BytesIO(data)
+
+
+def _cluster_pc_bands(store, job_id):
+    """The band diagram a CLUSTER pc Job wrote to ``result.json``, or ``None``.
+
+    The second half of the pc seam (see the status route). A cluster Job runs
+    ``mse_maxwell_solver`` inside the image, which writes
+    ``jobs/<id>/result.json`` holding the worker module's own payload --
+    ``{lattice, polarisation, labels, k_points, bands}`` -- and marks the row
+    DONE through its own DB client. Nothing writes ``pcs.bands`` on that route,
+    which is why the page was sent ``null`` for a job whose storage held a real
+    diagram.
+
+    Only the three keys the plot needs are returned, so the page gets the same
+    shape from either route. Everything here is defensive on purpose: this
+    reads a file the SOLVER wrote, and a malformed or pre-Contract result must
+    read as "no diagram yet" rather than raise inside a status poll and blank
+    the page. Returning ``None`` keeps the existing ``bands: null`` behaviour
+    for a job that genuinely has no diagram.
+
+    This deliberately does NOT import ``worker_api._band_payload`` (private to
+    that module, validated for a request BODY). The invariant it enforces is
+    the one that matters and is repeated here: ``k_points`` and ``bands`` are
+    the same length, every band vector is the same length, and every number is
+    finite -- a NaN in a plot is a band drawn at an invisible coordinate.
+    """
+    try:
+        raw = store.read(STORE.job_key(job_id, "result.json"))
+    except (FileNotFoundError, STORE.StorageError):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    labels = payload.get("labels")
+    k_points = payload.get("k_points")
+    bands = payload.get("bands")
+    if not (isinstance(labels, list) and isinstance(k_points, list)
+            and isinstance(bands, list)):
+        return None
+    if not labels or not k_points or not bands or len(k_points) != len(bands):
+        return None
+    if not all(isinstance(v, str) for v in labels):
+        return None
+    width = len(bands[0]) if isinstance(bands[0], list) else 0
+    if width == 0:
+        return None
+    for vec in bands:
+        if not isinstance(vec, list) or len(vec) != width:
+            return None
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in vec):
+            return None
+    for kpt in k_points:
+        if not isinstance(kpt, list) or len(kpt) != 2:
+            return None
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in kpt):
+            return None
+    return {"labels": labels, "k_points": k_points, "bands": bands}
 
 
 def _store(app):

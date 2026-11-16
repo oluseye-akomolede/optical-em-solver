@@ -5,7 +5,7 @@ test). Prints `KEY=VALUE` lines that the task record quotes, so every number in
 the record comes from this run rather than from memory.
 
     docker run --rm --cpus=2 --memory=2g --entrypoint python \
-        mse-solver:devsim-2.1 /opt/app/devsim_smoke.py
+        registry.example/mode-search-engine/mse-solver:devsim-2.1 /opt/app/devsim_smoke.py
 
 The `--entrypoint python` is required: the image's ENTRYPOINT is the solver, so
 without it the script path is swallowed as an argument to mse_maxwell_solver.py

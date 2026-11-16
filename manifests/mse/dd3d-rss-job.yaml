@@ -1,0 +1,154 @@
+# Task 2.7 (3): peak-RSS calibration of the 3-D drift-diffusion size gate.
+#
+# WHAT THIS MEASURES. mse_axisymmetric.JACOBIAN_NONZEROS_PER_NODE prices every
+# solve before it starts and was calibrated on 2-D axisymmetric grids only
+# (measured slope 0.83 vs the estimate's 1.5). This runs the 3-D tet form at
+# FOUR sizes and prints, per size, the estimate, the measured peak RSS and the
+# ratio between them. Those four rows are what a recalibrated threshold would
+# be based on.
+#
+# IT DOES NOT MOVE THE THRESHOLD. Task 2.7 (4) is explicit: no change to 2.5's
+# constant from this file. The numbers come back to the lead, the lead does the
+# measurement, and only then is a value proposed.
+#
+# WHY A FAN-OUT OF FOUR INDEXED PODS, NOT ONE SCRIPT LOOPING SIZES. Peak RSS is
+# a per-process high-water mark and DEVSIM, numpy and TetGen all stay resident.
+# A loop would report size 4's peak as the maximum of all four and the ratio
+# would be silently inflated. One indexed Job with four completions gives four
+# fresh processes (each pod runs exactly one index) while still counting as ONE
+# Job against the namespace's count/jobs.batch: 1 quota.
+#
+# RESOURCES, and why each number. ResourceQuota mse-power-cap gives this
+# namespace 5 CPU / 18Gi in total and the web Deployment holds a slice of it,
+# so the Job must stay under the LimitRange ceiling of 4 CPU / 16Gi. This Job
+# asks for 4 CPU / 13Gi: 13Gi leaves 5Gi for the app to keep running, and 4 CPU
+# is the ceiling a Job may not exceed. THE BOUND IS THE POINT: if a size really
+# needs more than 13Gi the pod dies with OOMKilled, and that failure is an
+# honest result ("the gate admits runs the Job cannot hold"), not something to
+# be avoided by asking for 16Gi.
+#
+# A size whose estimate exceeds the Job limit is REFUSED before any solve, by
+# design (2.5's gate, on the 3-D path). That row reports the estimate and the
+# mesher's own peak only; it is a legitimate outcome, not a failure.
+#
+# THREADS. A container CPU limit does not change os.cpu_count(), so every
+# thread pool in the image must be told the limit or the solve starts one
+# thread per HOST core and is throttled. The image defaults these to 4 already
+# (dockerfiles/maxwell_solver/Dockerfile); they are set again here so this file
+# stays correct if that default changes.
+#
+# RUN IT (lead's call -- the builder seat does not apply manifests):
+#
+#   kubectl -n mode-search-engine delete job mse-dd3d-rss --ignore-not-found
+#   kubectl -n mode-search-engine apply -f manifests/mse/dd3d-rss-job.yaml
+#   kubectl -n mode-search-engine wait --for=condition=complete job/mse-dd3d-rss --timeout=7200s
+#   kubectl -n mode-search-engine logs job/mse-dd3d-rss | grep ^RESULT
+#
+# Each size also gets its own log; `kubectl logs -l job-name=mse-dd3d-rss`
+# prints all four then. Rollback is `kubectl -n mode-search-engine delete job
+# mse-dd3d-rss`. The web app keeps running throughout; nothing here touches its
+# data.
+#
+# BEFORE APPLYING, THE IMAGE MUST EXIST. The pin below must name a tag built from
+# a commit containing BOTH dockerfiles/maxwell_solver/mse_axisymmetric.py (the
+# 3-D solver) and scripts/dd_3d_rss.py (the measurement). An earlier pin named
+# 968fa24, an ancestor that predates both file and script: the Job would have
+# died on import, which is why it was never applied.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mse-dd3d-rss
+  namespace: mode-search-engine
+  labels:
+    app: mse-dd3d-rss
+    purpose: calibration
+spec:
+  # One Job at a time is what the quota allows, so a stuck run must not hold
+  # the slot for hours: these sizes should take minutes each.
+  activeDeadlineSeconds: 7200
+  backoffLimit: 0
+  completions: 4
+  # One pod at a time: each asks 4 CPU / 13Gi and the quota (5 CPU / 18Gi, the
+  # web app holding 1 CPU / 2Gi) fits only one. parallelism 4 would leave three
+  # pods refused by the quota and retried. Sequential pods are still four fresh
+  # processes, so each peak RSS stays its own.
+  parallelism: 1
+  completionMode: Indexed           # each pod knows its own size from JOB_COMPLETION_INDEX
+  ttlSecondsAfterFinished: 86400    # a day to read the logs; delete manually after
+  template:
+    metadata:
+      labels:
+        app: mse-dd3d-rss
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: mse-harbor-pull
+      containers:
+        - name: rss
+          # This tag is NEWER than the deployment pin (1cca12b), which is fine:
+          # this Job needs a tag where the 3-D solver exists. 7dbd3b4 is the
+          # commit that measured these numbers; the calibration results in
+          # tasks.md were produced with it. When re-quoting them, say which tag
+          # measured them.
+          #
+          # REBUILT AT THE COMMIT THAT ADDS THE SCRIPT, which is a precondition,
+          # not a preference: the previous pin (968fa24) is an ancestor in which
+          # dockerfiles/maxwell_solver/mse_axisymmetric.py does not exist at all,
+          # so the script died on import before measuring anything. Verify with
+          #   git cat-file -e <sha>:dockerfiles/maxwell_solver/mse_axisymmetric.py
+          image: registry.example/mode-search-engine/mse-maxwell-solver:7dbd3b4
+          # The image's ENTRYPOINT is the solver, which would reject our --size
+          # argument. Override it rather than adding a flag to the solver's CLI.
+          # The script is IN the image (COPY dockerfiles/maxwell_solver/ /opt/app/
+          # puts it at /opt/app/scripts/dd_3d_rss.py), so it runs from there and
+          # no ConfigMap is needed.
+          command:
+            - python
+            - /opt/app/scripts/dd_3d_rss.py
+          args:
+            # --index picks the size from --sizes, so pod i prices size i.
+            - --index
+            - $(JOB_COMPLETION_INDEX)
+            - --sizes
+            # MEASURED at the commit that added scripts/dd_3d_rss.py, 1 um
+            # radius, 2 um total stack, default n_across:
+            #
+            #   edge_m     nodes     tets   estimate_GiB
+            #   1.6e-7      1136     5201          0.018
+            #   1.0e-7      4307    21926          0.128
+            #   7.0e-8     12157    65949          0.605
+            #   5.0e-8     32430   181319          2.627
+            #
+            # A 3.2x linear span, 146x in estimate. 5e-8 m is the finest that
+            # stays under the image's 200k tet cap (4e-8 needs 352k and the
+            # mesher refuses), and 1.6e-7 is the size the agreement test runs
+            # at. Going finer needs a smaller radius or a lower n_across, which
+            # would change the device -- not wanted here, because this run's
+            # job is to price the device we actually ship.
+            #
+            # EXPECT SMALL NUMBERS. The estimate at 5e-8 is 2.6 GiB against a
+            # 13Gi limit, so "fits the Job" is not in question at any of these
+            # sizes. That is the finding worth having: 2.5's per-node pricing is
+            # conservative enough that these 3-D solves could in fact run on the
+            # Jetson bench (tier 2) instead of a Job. The ratio this measures is
+            # what says so with numbers rather than assumption.
+            - "1.60e-7"
+            - "1.00e-7"
+            - "7.00e-8"
+            - "5.00e-8"
+          env:
+            # Threads equal the CPU limit (see the header).
+            - {name: OMP_NUM_THREADS, value: "4"}
+            - {name: MKL_NUM_THREADS, value: "4"}
+            - {name: OPENBLAS_NUM_THREADS, value: "4"}
+            - {name: NUMEXPR_NUM_THREADS, value: "4"}
+          resources:
+            # requests == limits: a burstable pod could be throttled by a
+            # neighbour mid-solve, which changes nothing about memory but does
+            # change the deadline.
+            requests: {cpu: "4", memory: 13Gi}
+            limits: {cpu: "4", memory: 13Gi}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+

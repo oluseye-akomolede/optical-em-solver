@@ -82,7 +82,6 @@ MODE_CHOICES = (10, 20, 40)
 #: assembly, so this size is what makes an upload that works today keep working
 #: on the GPU path.
 JOB_CPU = "4"
-JOB_MEMORY = "14Gi"
 JOB_ACTIVE_DEADLINE_SECONDS = 1800
 JOB_TTL_SECONDS_AFTER_FINISHED = 30
 
@@ -186,7 +185,16 @@ def _common_dir() -> str:
 
 
 _common_dir()
-from mse_common import DEFAULT_CPU_MAX_TETS, DEFAULT_MAX_TETS  # noqa: E402
+from mse_common import (  # noqa: E402
+    DEFAULT_CPU_MAX_TETS,
+    DEFAULT_JOB_MEMORY_BYTES,
+    DEFAULT_MAX_TETS,
+)
+
+#: PEAK MEMORY the solver Job is created with. Read from the solver package,
+#: not restated, so the limit the worker refuses against and the limit the Job
+#: is given cannot drift apart (electrical-simulation 2.5).
+JOB_MEMORY = f"{DEFAULT_JOB_MEMORY_BYTES // 1024 ** 3}Gi"
 
 #: the widest the estimate has been measured to read ABOVE the real mesh, as
 #: ``est_tets / built``. A RECORD of the sweep, not an input to a derivation.
